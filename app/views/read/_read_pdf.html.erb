@@ -1,0 +1,98 @@
+<script type="text/javascript">
+
+'use strict';
+
+$(function() {
+  var page = function() {
+    var renderPage = function(pdf, pageNum) {
+      var page = pdf.getPage(pageNum);
+      var scale = $('.container').width() / page.width;
+      var canvas = document.getElementById('page' + pageNum);
+      canvas.height = page.height * scale;
+      canvas.width = page.width * scale;
+
+      var context = canvas.getContext('2d');
+      page.startRendering(context);
+    }; 
+    
+    var setCurrentPageNumber = function(pageNum, nextPage) {
+      $(window).scroll(function() {
+        for(var i=0; i<$('canvas').length; i++) {
+
+          var pageTop = $('canvas').eq(i).position().top - 60;
+          var pageBottom = $('canvas').eq(i).position().top + $('canvas').eq(i).height();
+          var windowScrollTop = $(window).scrollTop();
+
+          if (pageTop <= windowScrollTop && pageBottom >= windowScrollTop) {
+            $(pageNum).val(i+1);
+            $(nextPage).val(i+2);
+          }
+        }
+      });
+    };
+    
+    var createPageCanvas = function(viewer, pageNum) {
+      if (!!!pageNum) return;
+
+      $(viewer)
+        .append(
+          $('<canvas />')
+          .attr({
+            id: 'page' + pageNum,
+            page: pageNum,
+            style: 'border:1px black; margin: 20px 0px; box-shadow: 0 4px 10px #000000;'
+            })
+        );
+    };
+    var enableInfiniteScroll = function(viewer, pdf, nextPage) {    
+      $(window).scroll(function() {
+        if ($(window).scrollTop() + 150 >= $(document).height() - $(window).height()) {
+          var nextPageNum = parseInt($(nextPage).val(), 10);
+
+          createPageCanvas($(viewer), nextPageNum);
+          renderPage(pdf, nextPageNum);
+
+          $(nextPage).val(nextPageNum + 1);
+        }        
+      });
+    };
+    
+    var scaleToPageWidth = function(pdf) {
+      $(window).resize(function() {
+        var fitToWindowSize = $(window).width() - 50;
+
+        $('.container').width(fitToWindowSize);
+        var canvases = $('canvas');
+        for (var i=0; i<canvases.length; i++) {
+          $(canvases[i]).remove();
+          createPageCanvas($('#viewer'), i+1);
+          renderPage(pdf, i+1);
+        }
+      });
+    };
+    
+    return {
+      renderPage : renderPage,
+      setCurrentPageNumber: setCurrentPageNumber,
+      createPageCanvas: createPageCanvas,
+      enableInfiniteScroll: enableInfiniteScroll,
+      scaleToPageWidth: scaleToPageWidth
+    } 
+  }();
+
+  PDFJS.workerSrc = '/assets/pdf.js';
+  PDFJS.getPdf('/compressed.tracemonkey-pldi-09.pdf', function(data) {
+
+    var pdf = new PDFJS.PDFDoc(data);
+
+    page.createPageCanvas($('#viewer'), 1);
+    page.renderPage(pdf, 1);
+    page.enableInfiniteScroll($('#viewer'), pdf, $('#nextPage'));
+    page.setCurrentPageNumber($('#pageNum'), $('#nextPage'));
+    page.scaleToPageWidth(pdf);
+
+  });
+    
+})
+
+</script>

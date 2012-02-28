@@ -1,0 +1,33 @@
+<%= render('read_pdf') %>
+
+<div class="navbar navbar-fixed-top">
+  <div class="navbar-inner">
+    <div class="container">
+      <a class="btn btn-navbar" data-toggle="collapse" data-target=".nav-collapse">
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+      </a>
+      <a class="brand" href="#">Read anywhere</a>
+      <div class="nav-collapse">
+        <ul class="nav">
+          <li><a href="#">Home</a></li>
+          <li class="active"><a href="#read">Read</a></li>
+          <li>
+            <form class="navbar-search pull-left">
+              <input type="text" id="pageNum" class="search-query" style="text-align: center;width: 30px;">
+            </form>
+          </li>
+        </ul>
+      </div><!--/.nav-collapse -->
+    </div>
+  </div>
+</div>
+
+<div class="container">
+
+  <div id="viewer"></div>
+
+  <input type="hidden" id="nextPage" name="nextPage" />
+
+</div> <!-- /container -->
