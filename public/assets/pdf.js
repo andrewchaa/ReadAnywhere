@@ -7,7 +7,7 @@ var PDFJS = {};
   // Use strict in our context only - users might not want it
   'use strict';
 
-  PDFJS.build = '5841383';
+  PDFJS.build = '65811a7';
 
   // Files are inserted below - see Makefile
   /* PDFJSSCRIPT_INCLUDE_ALL */
@@ -46,7 +46,9 @@ function getPdf(arg, callback) {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', params.url);
   xhr.mozResponseType = xhr.responseType = 'arraybuffer';
-  xhr.expected = (params.url.indexOf('file:') === 0) ? 0 : 200;
+  var protocol = params.url.indexOf(':') < 0 ? window.location.protocol :
+    params.url.substring(0, params.url.indexOf(':') + 1);
+  xhr.expected = (protocol === 'http:' || protocol === 'https:') ? 200 : 0;
 
   if ('progress' in params)
     xhr.onprogress = params.progress || undefined;
@@ -68,6 +70,7 @@ function getPdf(arg, callback) {
   xhr.send(null);
 }
 globalScope.PDFJS.getPdf = getPdf;
+globalScope.PDFJS.pdfBug = false;
 
 var Page = (function PageClosure() {
   function Page(xref, pageNumber, pageDict, ref) {
@@ -115,25 +118,35 @@ var Page = (function PageClosure() {
       return shadow(this, 'mediaBox', obj);
     },
     get view() {
-      var obj = this.inheritPageProp('CropBox');
+      var cropBox = this.inheritPageProp('CropBox');
       var view = {
         x: 0,
         y: 0,
         width: this.width,
         height: this.height
       };
+      if (!isArray(cropBox) || cropBox.length !== 4)
+        return shadow(this, 'view', view);
+
       var mediaBox = this.mediaBox;
       var offsetX = mediaBox[0], offsetY = mediaBox[1];
-      if (isArray(obj) && obj.length == 4) {
-        var tl = this.rotatePoint(obj[0] - offsetX, obj[1] - offsetY);
-        var br = this.rotatePoint(obj[2] - offsetX, obj[3] - offsetY);
-        view.x = Math.min(tl.x, br.x);
-        view.y = Math.min(tl.y, br.y);
-        view.width = Math.abs(tl.x - br.x);
-        view.height = Math.abs(tl.y - br.y);
-      }
 
-      return shadow(this, 'cropBox', view);
+      // From the spec, 6th ed., p.963:
+      // "The crop, bleed, trim, and art boxes should not ordinarily
+      // extend beyond the boundaries of the media box. If they do, they are
+      // effectively reduced to their intersection with the media box."
+      cropBox = Util.intersect(cropBox, mediaBox);
+      if (!cropBox)
+        return shadow(this, 'view', view);
+
+      var tl = this.rotatePoint(cropBox[0] - offsetX, cropBox[1] - offsetY);
+      var br = this.rotatePoint(cropBox[2] - offsetX, cropBox[3] - offsetY);
+      view.x = Math.min(tl.x, br.x);
+      view.y = Math.min(tl.y, br.y);
+      view.width = Math.abs(tl.x - br.x);
+      view.height = Math.abs(tl.y - br.y);
+
+      return shadow(this, 'view', view);
     },
     get annotations() {
       return shadow(this, 'annotations', this.inheritPageProp('Annots'));
@@ -255,10 +268,16 @@ var Page = (function PageClosure() {
       var startIdx = 0;
       var length = this.IRQueue.fnArray.length;
       var IRQueue = this.IRQueue;
+      var stepper = null;
+      if (PDFJS.pdfBug && StepperManager.enabled) {
+        stepper = StepperManager.create(this.pageNumber);
+        stepper.init(IRQueue);
+        stepper.nextBreakPoint = stepper.getNextBreakPoint();
+      }
 
       var self = this;
       function next() {
-        startIdx = gfx.executeIRQueue(IRQueue, startIdx, next);
+        startIdx = gfx.executeIRQueue(IRQueue, startIdx, next, stepper);
         if (startIdx == length) {
           self.stats.render = Date.now();
           gfx.endDrawing();
@@ -423,14 +442,14 @@ var Page = (function PageClosure() {
             if (callback)
               callback(e);
             else
-              throw e;
+              error(e);
           }
         }.bind(this),
         function pageDisplayReadPromiseError(reason) {
           if (callback)
             callback(reason);
           else
-            throw reason;
+            error(reason);
         }
       );
     }
@@ -633,13 +652,23 @@ var PDFDoc = (function PDFDocClosure() {
     if (!globalScope.PDFJS.disableWorker && typeof Worker !== 'undefined') {
       var workerSrc = PDFJS.workerSrc;
       if (typeof workerSrc === 'undefined') {
-        throw 'No PDFJS.workerSrc specified';
+        error('No PDFJS.workerSrc specified');
       }
 
       try {
-        // Some versions of FF can't create a worker on localhost, see:
-        // https://bugzilla.mozilla.org/show_bug.cgi?id=683280
-        var worker = new Worker(workerSrc);
+        var worker;
+        if (PDFJS.isFirefoxExtension) {
+          // The firefox extension can't load the worker from the resource://
+          // url so we have to inline the script and then use the blob loader.
+          var bb = new MozBlobBuilder();
+          bb.append(document.querySelector('#PDFJS_SCRIPT_TAG').textContent);
+          var blobUrl = window.URL.createObjectURL(bb.getBlob());
+          worker = new Worker(blobUrl);
+        } else {
+          // Some versions of FF can't create a worker on localhost, see:
+          // https://bugzilla.mozilla.org/show_bug.cgi?id=683280
+          worker = new Worker(workerSrc);
+        }
 
         var messageHandler = new MessageHandler('main', worker);
 
@@ -658,7 +687,9 @@ var PDFDoc = (function PDFDocClosure() {
         // serializing the typed array.
         messageHandler.send('test', testObj);
         return;
-      } catch (e) {}
+      } catch (e) {
+        warn('The worker has been disabled.');
+      }
     }
     // Either workers are disabled, not supported or have thrown an exception.
     // Thus, we fallback to a faked worker.
@@ -729,7 +760,7 @@ var PDFDoc = (function PDFDocClosure() {
             });
             break;
           default:
-            throw 'Got unkown object type ' + type;
+            error('Got unkown object type ' + type);
         }
       }, this);
 
@@ -750,7 +781,7 @@ var PDFDoc = (function PDFDocClosure() {
         if (page.displayReadyPromise)
           page.displayReadyPromise.reject(data.error);
         else
-          throw data.error;
+          error(data.error);
       }, this);
 
       messageHandler.on('jpeg_decode', function(data, promise) {
@@ -919,22 +950,151 @@ var IDENTITY_MATRIX = [1, 0, 0, 1, 0, 0];
 
 var Util = (function UtilClosure() {
   function Util() {}
+
   Util.makeCssRgb = function makergb(r, g, b) {
     var ri = (255 * r) | 0, gi = (255 * g) | 0, bi = (255 * b) | 0;
     return 'rgb(' + ri + ',' + gi + ',' + bi + ')';
   };
+
   Util.makeCssCmyk = function makecmyk(c, m, y, k) {
     c = (new DeviceCmykCS()).getRgb([c, m, y, k]);
     var ri = (255 * c[0]) | 0, gi = (255 * c[1]) | 0, bi = (255 * c[2]) | 0;
     return 'rgb(' + ri + ',' + gi + ',' + bi + ')';
   };
+
+  // For 2d affine transforms
   Util.applyTransform = function apply(p, m) {
     var xt = p[0] * m[0] + p[1] * m[2] + m[4];
     var yt = p[0] * m[1] + p[1] * m[3] + m[5];
     return [xt, yt];
   };
 
+  // Apply a generic 3d matrix M on a 3-vector v:
+  //   | a b c |   | X |
+  //   | d e f | x | Y |
+  //   | g h i |   | Z |
+  // M is assumed to be serialized as [a,b,c,d,e,f,g,h,i],
+  // with v as [X,Y,Z]
+  Util.apply3dTransform = function apply3d(m, v) {
+    return [
+      m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+      m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+      m[6] * v[0] + m[7] * v[1] + m[8] * v[2]
+    ];
+  }
+
+  // Normalize rectangle rect=[x1, y1, x2, y2] so that (x1,y1) < (x2,y2)
+  // For coordinate systems whose origin lies in the bottom-left, this
+  // means normalization to (BL,TR) ordering. For systems with origin in the
+  // top-left, this means (TL,BR) ordering.
+  Util.normalizeRect = function normalizeRect(rect) {
+    var r = rect.slice(0); // clone rect
+    if (rect[0] > rect[2]) {
+      r[0] = rect[2];
+      r[2] = rect[0];
+    }
+    if (rect[1] > rect[3]) {
+      r[1] = rect[3];
+      r[3] = rect[1];
+    }
+    return r;
+  }
+
+  // Returns a rectangle [x1, y1, x2, y2] corresponding to the
+  // intersection of rect1 and rect2. If no intersection, returns 'false'
+  // The rectangle coordinates of rect1, rect2 should be [x1, y1, x2, y2]
+  Util.intersect = function intersect(rect1, rect2) {
+    function compare(a, b) {
+      return a - b;
+    };
+
+    // Order points along the axes
+    var orderedX = [rect1[0], rect1[2], rect2[0], rect2[2]].sort(compare),
+        orderedY = [rect1[1], rect1[3], rect2[1], rect2[3]].sort(compare),
+        result = [];
+
+    rect1 = Util.normalizeRect(rect1);
+    rect2 = Util.normalizeRect(rect2);
+
+    // X: first and second points belong to different rectangles?
+    if ((orderedX[0] === rect1[0] && orderedX[1] === rect2[0]) ||
+        (orderedX[0] === rect2[0] && orderedX[1] === rect1[0])) {
+      // Intersection must be between second and third points
+      result[0] = orderedX[1];
+      result[2] = orderedX[2];
+    } else {
+      return false;
+    }
+
+    // Y: first and second points belong to different rectangles?
+    if ((orderedY[0] === rect1[1] && orderedY[1] === rect2[1]) ||
+        (orderedY[0] === rect2[1] && orderedY[1] === rect1[1])) {
+      // Intersection must be between second and third points
+      result[1] = orderedY[1];
+      result[3] = orderedY[2];
+    } else {
+      return false;
+    }
+
+    return result;
+  }
+
+  Util.sign = function sign(num) {
+    return num < 0 ? -1 : 1;
+  };
+
   return Util;
+})();
+
+// optimised CSS custom property getter/setter
+var CustomStyle = (function CustomStyleClosure() {
+
+  // As noted on: http://www.zachstronaut.com/posts/2009/02/17/
+  //              animate-css-transforms-firefox-webkit.html
+  // in some versions of IE9 it is critical that ms appear in this list
+  // before Moz
+  var prefixes = ['ms', 'Moz', 'Webkit', 'O'];
+  var _cache = { };
+
+  function CustomStyle() {
+  }
+
+  CustomStyle.getProp = function get(propName, element) {
+    // check cache only when no element is given
+    if (arguments.length == 1 && typeof _cache[propName] == 'string') {
+      return _cache[propName];
+    }
+
+    element = element || document.documentElement;
+    var style = element.style, prefixed, uPropName;
+
+    // test standard property first
+    if (typeof style[propName] == 'string') {
+      return (_cache[propName] = propName);
+    }
+
+    // capitalize
+    uPropName = propName.charAt(0).toUpperCase() + propName.slice(1);
+
+    // test vendor specific properties
+    for (var i = 0, l = prefixes.length; i < l; i++) {
+      prefixed = prefixes[i] + uPropName;
+      if (typeof style[prefixed] == 'string') {
+        return (_cache[propName] = prefixed);
+      }
+    }
+
+    //if all fails then set to undefined
+    return (_cache[propName] = 'undefined');
+  }
+
+  CustomStyle.setProp = function set(propName, element, str) {
+    var prop = this.getProp(propName);
+    if (prop != 'undefined')
+      element.style[prop] = str;
+  }
+
+  return CustomStyle;
 })();
 
 var PDFStringTranslateTable = [
@@ -1096,8 +1256,8 @@ var Promise = (function PromiseClosure() {
         return;
       }
       if (this._data !== EMPTY_PROMISE) {
-        throw 'Promise ' + this.name +
-                                ': Cannot set the data of a promise twice';
+        error('Promise ' + this.name +
+              ': Cannot set the data of a promise twice');
       }
       this._data = value;
       this.hasData = true;
@@ -1109,7 +1269,7 @@ var Promise = (function PromiseClosure() {
 
     get data() {
       if (this._data === EMPTY_PROMISE) {
-        throw 'Promise ' + this.name + ': Cannot get data that isn\'t set';
+        error('Promise ' + this.name + ': Cannot get data that isn\'t set');
       }
       return this._data;
     },
@@ -1124,10 +1284,10 @@ var Promise = (function PromiseClosure() {
 
     resolve: function promiseResolve(data) {
       if (this.isResolved) {
-        throw 'A Promise can be resolved only once ' + this.name;
+        error('A Promise can be resolved only once ' + this.name);
       }
       if (this.isRejected) {
-        throw 'The Promise was already rejected ' + this.name;
+        error('The Promise was already rejected ' + this.name);
       }
 
       this.isResolved = true;
@@ -1141,10 +1301,10 @@ var Promise = (function PromiseClosure() {
 
     reject: function proimseReject(reason) {
       if (this.isRejected) {
-        throw 'A Promise can be rejected only once ' + this.name;
+        error('A Promise can be rejected only once ' + this.name);
       }
       if (this.isResolved) {
-        throw 'The Promise was already resolved ' + this.name;
+        error('The Promise was already resolved ' + this.name);
       }
 
       this.isRejected = true;
@@ -1158,7 +1318,7 @@ var Promise = (function PromiseClosure() {
 
     then: function promiseThen(callback, errback) {
       if (!callback) {
-        throw 'Requiring callback' + this.name;
+        error('Requiring callback' + this.name);
       }
 
       // If the promise is already resolved, call the callback directly.
@@ -1198,12 +1358,17 @@ var TextRenderingMode = {
   ADD_TO_PATH: 7
 };
 
+// Minimal font size that would be used during canvas fillText operations.
+var MIN_FONT_SIZE = 1;
+
 var CanvasExtraState = (function CanvasExtraStateClosure() {
   function CanvasExtraState(old) {
     // Are soft masks and alpha values shapes or opacities?
     this.alphaIsShape = false;
     this.fontSize = 0;
+    this.fontSizeScale = 1;
     this.textMatrix = IDENTITY_MATRIX;
+    this.fontMatrix = IDENTITY_MATRIX;
     this.leading = 0;
     // Current point (in user coordinates)
     this.x = 0;
@@ -1445,7 +1610,8 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
     },
 
     executeIRQueue: function canvasGraphicsExecuteIRQueue(codeIR,
-                                  executionStartIdx, continueCallback) {
+                                  executionStartIdx, continueCallback,
+                                  stepper) {
       var argsArray = codeIR.argsArray;
       var fnArray = codeIR.fnArray;
       var i = executionStartIdx || 0;
@@ -1464,6 +1630,11 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       var slowCommands = this.slowCommands;
 
       while (true) {
+        if (stepper && i === stepper.nextBreakPoint) {
+          stepper.breakIt(i, continueCallback);
+          return i;
+        }
+
         fnName = fnArray[i];
 
         if (fnName !== 'dependency') {
@@ -1727,15 +1898,38 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
     },
     setFont: function canvasGraphicsSetFont(fontRefName, size) {
       var fontObj = this.objs.get(fontRefName).fontObj;
+      var current = this.current;
 
-      if (!fontObj) {
-        throw 'Can\'t find font for ' + fontRefName;
+      if (!fontObj)
+        error('Can\'t find font for ' + fontRefName);
+
+      // Slice-clone matrix so we can manipulate it without affecting original
+      if (fontObj.fontMatrix)
+        current.fontMatrix = fontObj.fontMatrix.slice(0);
+      else
+        current.fontMatrix = IDENTITY_MATRIX.slice(0);
+
+      // A valid matrix needs all main diagonal elements to be non-zero
+      // This also ensures we bypass FF bugzilla bug #719844.
+      if (current.fontMatrix[0] === 0 ||
+          current.fontMatrix[3] === 0) {
+        warn('Invalid font matrix for font ' + fontRefName);
       }
 
-      var name = fontObj.loadedName || 'sans-serif';
+      // The spec for Tf (setFont) says that 'size' specifies the font 'scale',
+      // and in some docs this can be negative (inverted x-y axes).
+      // We implement this condition with fontMatrix.
+      if (size < 0) {
+        size = -size;
+        current.fontMatrix[0] *= -1;
+        current.fontMatrix[3] *= -1;
+      }
 
       this.current.font = fontObj;
       this.current.fontSize = size;
+
+      if (fontObj.coded)
+        return; // we don't need ctx.font for Type3 fonts
 
       var name = fontObj.loadedName || 'sans-serif';
       var bold = fontObj.black ? (fontObj.bold ? 'bolder' : 'bold') :
@@ -1744,7 +1938,16 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       var italic = fontObj.italic ? 'italic' : 'normal';
       var serif = fontObj.isSerifFont ? 'serif' : 'sans-serif';
       var typeface = '"' + name + '", ' + serif;
-      var rule = italic + ' ' + bold + ' ' + size + 'px ' + typeface;
+
+      // Some font backends cannot handle fonts below certain size.
+      // Keeping the font at minimal size and using the fontSizeScale to change
+      // the current transformation matrix before the fillText/strokeText.
+      // See https://bugzilla.mozilla.org/show_bug.cgi?id=726227
+      var browserFontSize = size >= MIN_FONT_SIZE ? size : MIN_FONT_SIZE;
+      this.current.fontSizeScale = browserFontSize != MIN_FONT_SIZE ? 1.0 :
+                                   size / MIN_FONT_SIZE;
+
+      var rule = italic + ' ' + bold + ' ' + browserFontSize + 'px ' + typeface;
       this.ctx.font = rule;
     },
     setTextRenderingMode: function canvasGraphicsSetTextRenderingMode(mode) {
@@ -1776,7 +1979,7 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       var ctx = this.ctx;
       var current = this.current;
       var textHScale = current.textHScale;
-      var fontMatrix = current.font.fontMatrix || IDENTITY_MATRIX;
+      var fontMatrix = current.fontMatrix || IDENTITY_MATRIX;
 
       ctx.transform.apply(ctx, current.textMatrix);
       ctx.scale(1, -1);
@@ -1807,10 +2010,11 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       var font = current.font;
       var glyphs = font.charsToGlyphs(str);
       var fontSize = current.fontSize;
+      var fontSizeScale = current.fontSizeScale;
       var charSpacing = current.charSpacing;
       var wordSpacing = current.wordSpacing;
       var textHScale = current.textHScale;
-      var fontMatrix = font.fontMatrix || IDENTITY_MATRIX;
+      var fontMatrix = current.fontMatrix || IDENTITY_MATRIX;
       var textHScale2 = textHScale * fontMatrix[0];
       var glyphsLength = glyphs.length;
       var textLayer = this.textLayer;
@@ -1848,7 +2052,8 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
           this.restore();
 
           var transformed = Util.applyTransform([glyph.width, 0], fontMatrix);
-          var width = transformed[0] * fontSize + charSpacing;
+          var width = transformed[0] * fontSize +
+              Util.sign(current.fontMatrix[0]) * charSpacing;
 
           ctx.translate(width, 0);
           current.x += width * textHScale;
@@ -1869,49 +2074,64 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
         else
           lineWidth /= scale;
 
-        ctx.lineWidth = lineWidth;
-
         if (textSelection)
           text.geom = this.getTextGeometry();
 
-        var width = 0;
+        if (fontSizeScale != 1.0) {
+          ctx.scale(fontSizeScale, fontSizeScale);
+          lineWidth /= fontSizeScale;
+        }
+
+        ctx.lineWidth = lineWidth;
+
+        var x = 0;
         for (var i = 0; i < glyphsLength; ++i) {
           var glyph = glyphs[i];
           if (glyph === null) {
             // word break
-            width += wordSpacing;
+            x += Util.sign(current.fontMatrix[0]) * wordSpacing;
             continue;
           }
 
           var char = glyph.fontChar;
-          var charWidth = glyph.width * fontSize * 0.001 + charSpacing;
+          var charWidth = glyph.width * fontSize * 0.001 +
+              Util.sign(current.fontMatrix[0]) * charSpacing;
 
+          var scaledX = x / fontSizeScale;
           switch (textRenderingMode) {
             default: // other unsupported rendering modes
             case TextRenderingMode.FILL:
             case TextRenderingMode.FILL_ADD_TO_PATH:
-              ctx.fillText(char, width, 0);
+              ctx.fillText(char, scaledX, 0);
               break;
             case TextRenderingMode.STROKE:
             case TextRenderingMode.STROKE_ADD_TO_PATH:
-              ctx.strokeText(char, width, 0);
+              ctx.strokeText(char, scaledX, 0);
               break;
             case TextRenderingMode.FILL_STROKE:
             case TextRenderingMode.FILL_STROKE_ADD_TO_PATH:
-              ctx.fillText(char, width, 0);
-              ctx.strokeText(char, width, 0);
+              ctx.fillText(char, scaledX, 0);
+              ctx.strokeText(char, scaledX, 0);
               break;
             case TextRenderingMode.INVISIBLE:
               break;
           }
 
-          width += charWidth;
+          x += charWidth;
 
-          text.str += glyph.unicode === ' ' ? '\u00A0' : glyph.unicode;
-          text.length++;
+          var glyphUnicode = glyph.unicode === ' ' ? '\u00A0' : glyph.unicode;
+          var glyphUnicodeLength = glyphUnicode.length;
+          //reverse an arabic ligature
+          if (glyphUnicodeLength > 1 &&
+              isRTLRangeFor(glyphUnicode.charCodeAt(0))) {
+            for (var ii = glyphUnicodeLength - 1; ii >= 0; ii--)
+              text.str += glyphUnicode[ii];
+          } else
+            text.str += glyphUnicode;
+          text.length += glyphUnicodeLength;
           text.canvasWidth += charWidth;
         }
-        current.x += width * textHScale2;
+        current.x += x * textHScale2;
         ctx.restore();
       }
 
@@ -1927,7 +2147,7 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       var fontSize = current.fontSize;
       var textHScale = current.textHScale;
       if (!font.coded)
-        textHScale *= (font.fontMatrix || IDENTITY_MATRIX)[0];
+        textHScale *= (current.fontMatrix || IDENTITY_MATRIX)[0];
       var arrLength = arr.length;
       var textLayer = this.textLayer;
       var text = {str: '', length: 0, canvasWidth: 0, geom: {}};
@@ -1974,7 +2194,7 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
               text.str += shownText.str;
             }
             text.canvasWidth += shownText.canvasWidth;
-            text.length += e.length;
+            text.length += shownText.length;
           }
         } else {
           malformed('TJ array element ' + e + ' is not string or num');
@@ -2047,7 +2267,7 @@ var CanvasGraphics = (function CanvasGraphicsClosure() {
       } else if (IR[0] == 'RadialAxial' || IR[0] == 'Dummy') {
         var pattern = Pattern.shadingFromIR(this.ctx, IR);
       } else {
-        throw 'Unkown IR type';
+        error('Unkown IR type ' + IR[0]);
       }
       return pattern;
     },
@@ -2668,74 +2888,69 @@ var XRef = (function XRefClosure() {
 
   XRef.prototype = {
     readXRefTable: function readXRefTable(parser) {
+      // Example of cross-reference table:
+      // xref
+      // 0 1                    <-- subsection header (first obj #, obj count)
+      // 0000000000 65535 f     <-- actual object (offset, generation #, f/n)
+      // 23 2                   <-- subsection header ... and so on ...
+      // 0000025518 00002 n
+      // 0000025635 00000 n
+      // trailer
+      // ...
+
+      // Outer loop is over subsection headers
       var obj;
-      while (true) {
-        if (isCmd(obj = parser.getObj(), 'trailer'))
-          break;
-        if (!isInt(obj))
-          error('Invalid XRef table');
-        var first = obj;
-        if (!isInt(obj = parser.getObj()))
-          error('Invalid XRef table');
-        var n = obj;
-        if (first < 0 || n < 0 || (first + n) != ((first + n) | 0))
-          error('Invalid XRef table: ' + first + ', ' + n);
-        for (var i = first; i < first + n; ++i) {
+      while (!isCmd(obj = parser.getObj(), 'trailer')) {
+        var first = obj,
+            count = parser.getObj();
+
+        if (!isInt(first) || !isInt(count))
+          error('Invalid XRef table: wrong types in subsection header');
+
+        // Inner loop is over objects themselves
+        for (var i = 0; i < count; i++) {
           var entry = {};
-          if (!isInt(obj = parser.getObj()))
-            error('Invalid XRef table: ' + first + ', ' + n);
-          entry.offset = obj;
-          if (!isInt(obj = parser.getObj()))
-            error('Invalid XRef table: ' + first + ', ' + n);
-          entry.gen = obj;
-          obj = parser.getObj();
-          if (isCmd(obj, 'n')) {
-            entry.uncompressed = true;
-          } else if (isCmd(obj, 'f')) {
+          entry.offset = parser.getObj();
+          entry.gen = parser.getObj();
+          var type = parser.getObj();
+
+          if (isCmd(type, 'f'))
             entry.free = true;
-          } else {
-            error('Invalid XRef table: ' + first + ', ' + n);
+          else if (isCmd(type, 'n'))
+            entry.uncompressed = true;
+
+          // Validate entry obj
+          if (!isInt(entry.offset) || !isInt(entry.gen) ||
+              !(entry.free || entry.uncompressed)) {
+            error('Invalid entry in XRef subsection: ' + first + ', ' + count);
           }
-          if (!this.entries[i]) {
-            // In some buggy PDF files the xref table claims to start at 1
-            // instead of 0.
-            if (i == 1 && first == 1 &&
-                entry.offset == 0 && entry.gen == 65535 && entry.free) {
-              i = first = 0;
-            }
-            this.entries[i] = entry;
-          }
+
+          if (!this.entries[i + first])
+            this.entries[i + first] = entry;
         }
       }
 
-      // read the trailer dictionary
-      var dict;
-      if (!isDict(dict = parser.getObj()))
-        error('Invalid XRef table');
+      // Sanity check: as per spec, first object must have these properties
+      if (this.entries[0] &&
+          !(this.entries[0].gen === 65535 && this.entries[0].free))
+        error('Invalid XRef table: unexpected first object');
 
-      // get the 'Prev' pointer
-      var prev;
-      obj = dict.get('Prev');
-      if (isInt(obj)) {
-        prev = obj;
-      } else if (isRef(obj)) {
-        // certain buggy PDF generators generate "/Prev NNN 0 R" instead
-        // of "/Prev NNN"
-        prev = obj.num;
-      }
-      if (prev) {
-        this.readXRef(prev);
-      }
+      // Sanity check
+      if (!isCmd(obj, 'trailer'))
+        error('Invalid XRef table: could not find trailer dictionary');
 
-      // check for 'XRefStm' key
-      if (isInt(obj = dict.get('XRefStm'))) {
-        var pos = obj;
-        // ignore previously loaded xref streams (possible infinite recursion)
-        if (!(pos in this.xrefstms)) {
-          this.xrefstms[pos] = 1;
-          this.readXRef(pos);
-        }
-      }
+      // Read trailer dictionary, e.g.
+      // trailer
+      //    << /Size 22
+      //      /Root 20R
+      //      /Info 10R
+      //      /ID [ <81b14aafa313db63dbd6f981e49f94f4> ]
+      //    >>
+      // The parser goes through the entire stream << ... >> and provides
+      // a getter interface for the key-value table
+      var dict = parser.getObj();
+      if (!isDict(dict))
+        error('Invalid XRef table: could not parse trailer dictionary');
 
       return dict;
     },
@@ -2788,9 +3003,6 @@ var XRef = (function XRefClosure() {
         }
         range.splice(0, 2);
       }
-      var prev = streamParameters.get('Prev');
-      if (isInt(prev))
-        this.readXRef(prev);
       return streamParameters;
     },
     indexObjects: function indexObjects() {
@@ -2910,22 +3122,47 @@ var XRef = (function XRefClosure() {
       try {
         var parser = new Parser(new Lexer(stream), true);
         var obj = parser.getObj();
+        var dict;
 
-        // parse an old-style xref table
-        if (isCmd(obj, 'xref'))
-          return this.readXRefTable(parser);
+        // Get dictionary
+        if (isCmd(obj, 'xref')) {
+          // Parse end-of-file XRef
+          dict = this.readXRefTable(parser);
 
-        // parse an xref stream
-        if (isInt(obj)) {
+          // Recursively get other XRefs 'XRefStm', if any
+          obj = dict.get('XRefStm');
+          if (isInt(obj)) {
+            var pos = obj;
+            // ignore previously loaded xref streams
+            // (possible infinite recursion)
+            if (!(pos in this.xrefstms)) {
+              this.xrefstms[pos] = 1;
+              this.readXRef(pos);
+            }
+          }
+        } else if (isInt(obj)) {
+          // Parse in-stream XRef
           if (!isInt(parser.getObj()) ||
               !isCmd(parser.getObj(), 'obj') ||
               !isStream(obj = parser.getObj())) {
             error('Invalid XRef stream');
           }
-          return this.readXRefStream(obj);
+          dict = this.readXRefStream(obj);
         }
+
+        // Recursively get previous dictionary, if any
+        obj = dict.get('Prev');
+        if (isInt(obj))
+          this.readXRef(obj);
+        else if (isRef(obj)) {
+          // The spec says Prev must not be a reference, i.e. "/Prev NNN"
+          // This is a fallback for non-compliant PDFs, i.e. "/Prev NNN 0 R"
+          this.readXRef(obj.num);
+        }
+
+        return dict;
       } catch (e) {
-        log('Reading of the xref table/stream failed: ' + e);
+        log('(while reading XRef): ' + e);
       }
 
       warn('Indexing all PDF objects');
@@ -2955,7 +3192,7 @@ var XRef = (function XRefClosure() {
       var stream, parser;
       if (e.uncompressed) {
         if (e.gen != gen)
-          throw ('inconsistent generation in XRef');
+          error('inconsistent generation in XRef');
         stream = this.stream.makeSubStream(e.offset);
         parser = new Parser(new Lexer(stream), true, this);
         var obj1 = parser.getObj();
@@ -3084,7 +3321,7 @@ var PDFObjects = (function PDFObjectsClosure() {
       // If there isn't an object yet or the object isn't resolved, then the
       // data isn't ready yet!
       if (!obj || !obj.isResolved) {
-        throw 'Requesting object that isn\'t resolved yet ' + objId;
+        error('Requesting object that isn\'t resolved yet ' + objId);
         return null;
       } else {
         return obj.data;
@@ -3266,109 +3503,99 @@ var PDFFunction = (function PDFFunctionClosure() {
       else
         decode = toMultiArray(decode);
 
-      // Precalc the multipliers
-      var inputMul = new Float64Array(inputSize);
-      for (var i = 0; i < inputSize; ++i) {
-        inputMul[i] = (encode[i][1] - encode[i][0]) /
-                  (domain[i][1] - domain[i][0]);
-      }
-
-      var idxMul = new Int32Array(inputSize);
-      idxMul[0] = outputSize;
-      for (i = 1; i < inputSize; ++i) {
-        idxMul[i] = idxMul[i - 1] * size[i - 1];
-      }
-
-      var nSamples = outputSize;
-      for (i = 0; i < inputSize; ++i)
-          nSamples *= size[i];
-
       var samples = this.getSampleArray(size, outputSize, bps, str);
 
       return [
         CONSTRUCT_SAMPLED, inputSize, domain, encode, decode, samples, size,
-        outputSize, bps, range, inputMul, idxMul, nSamples
+        outputSize, Math.pow(2, bps) - 1, range
       ];
     },
 
     constructSampledFromIR: function pdfFunctionConstructSampledFromIR(IR) {
-      var inputSize = IR[1];
-      var domain = IR[2];
-      var encode = IR[3];
-      var decode = IR[4];
-      var samples = IR[5];
-      var size = IR[6];
-      var outputSize = IR[7];
-      var bps = IR[8];
-      var range = IR[9];
-      var inputMul = IR[10];
-      var idxMul = IR[11];
-      var nSamples = IR[12];
+      // See chapter 3, page 109 of the PDF reference
+      function interpolate(x, xmin, xmax, ymin, ymax) {
+        return ymin + ((x - xmin) * ((ymax - ymin) / (xmax - xmin)));
+      }
 
       return function constructSampledFromIRResult(args) {
-        if (inputSize != args.length)
+        // See chapter 3, page 110 of the PDF reference.
+        var m = IR[1];
+        var domain = IR[2];
+        var encode = IR[3];
+        var decode = IR[4];
+        var samples = IR[5];
+        var size = IR[6];
+        var n = IR[7];
+        var mask = IR[8];
+        var range = IR[9];
+
+        if (m != args.length)
           error('Incorrect number of arguments: ' + inputSize + ' != ' +
                 args.length);
-        // Most of the below is a port of Poppler's implementation.
-        // TODO: There's a few other ways to do multilinear interpolation such
-        // as piecewise, which is much faster but an approximation.
-        var out = new Float64Array(outputSize);
-        var x;
-        var e = new Array(inputSize);
-        var efrac0 = new Float64Array(inputSize);
-        var efrac1 = new Float64Array(inputSize);
-        var sBuf = new Float64Array(1 << inputSize);
-        var i, j, k, idx, t;
 
-        // map input values into sample array
-        for (i = 0; i < inputSize; ++i) {
-          x = (args[i] - domain[i][0]) * inputMul[i] + encode[i][0];
-          if (x < 0) {
-            x = 0;
-          } else if (x > size[i] - 1) {
-            x = size[i] - 1;
-          }
-          e[i] = [Math.floor(x), 0];
-          if ((e[i][1] = e[i][0] + 1) >= size[i]) {
-            // this happens if in[i] = domain[i][1]
-            e[i][1] = e[i][0];
-          }
-          efrac1[i] = x - e[i][0];
-          efrac0[i] = 1 - efrac1[i];
-        }
+        var x = args;
 
-        // for each output, do m-linear interpolation
-        for (i = 0; i < outputSize; ++i) {
+        // Building the cube vertices: its part and sample index
+        // http://rjwagner49.com/Mathematics/Interpolation.pdf
+        var cubeVertices = 1 << m;
+        var cubeN = new Float64Array(cubeVertices);
+        var cubeVertex = new Uint32Array(cubeVertices);
+        for (var j = 0; j < cubeVertices; j++)
+          cubeN[j] = 1;
 
-          // pull 2^m values out of the sample array
-          for (j = 0; j < (1 << inputSize); ++j) {
-            idx = i;
-            for (k = 0, t = j; k < inputSize; ++k, t >>= 1) {
-              idx += idxMul[k] * (e[k][t & 1]);
-            }
-            if (idx >= 0 && idx < nSamples) {
-              sBuf[j] = samples[idx];
+        var k = n, pos = 1;
+        // Map x_i to y_j for 0 <= i < m using the sampled function.
+        for (var i = 0; i < m; ++i) {
+          // x_i' = min(max(x_i, Domain_2i), Domain_2i+1)
+          var domain_2i = domain[i][0];
+          var domain_2i_1 = domain[i][1];
+          var xi = Math.min(Math.max(x[i], domain_2i), domain_2i_1);
+
+          // e_i = Interpolate(x_i', Domain_2i, Domain_2i+1,
+          //                   Encode_2i, Encode_2i+1)
+          var e = interpolate(xi, domain_2i, domain_2i_1,
+                              encode[i][0], encode[i][1]);
+
+          // e_i' = min(max(e_i, 0), Size_i - 1)
+          var size_i = size[i];
+          e = Math.min(Math.max(e, 0), size_i - 1);
+
+          // Adjusting the cube: N and vertex sample index
+          var e0 = e < size_i - 1 ? Math.floor(e) : e - 1; // e1 = e0 + 1;
+          var n0 = e0 + 1 - e; // (e1 - e) / (e1 - e0);
+          var n1 = e - e0; // (e - e0) / (e1 - e0);
+          var offset0 = e0 * k;
+          var offset1 = offset0 + k; // e1 * k
+          for (var j = 0; j < cubeVertices; j++) {
+            if (j & pos) {
+              cubeN[j] *= n1;
+              cubeVertex[j] += offset1;
             } else {
-              sBuf[j] = 0; // TODO Investigate if this is what Adobe does
+              cubeN[j] *= n0;
+              cubeVertex[j] += offset0;
             }
           }
 
-          // do m sets of interpolations
-          for (j = 0, t = (1 << inputSize); j < inputSize; ++j, t >>= 1) {
-            for (k = 0; k < t; k += 2) {
-              sBuf[k >> 1] = efrac0[j] * sBuf[k] + efrac1[j] * sBuf[k + 1];
-            }
-          }
-
-          // map output value to range
-          out[i] = (sBuf[0] * (decode[i][1] - decode[i][0]) + decode[i][0]);
-          if (out[i] < range[i][0]) {
-            out[i] = range[i][0];
-          } else if (out[i] > range[i][1]) {
-            out[i] = range[i][1];
-          }
+          k *= size_i;
+          pos <<= 1;
         }
-        return out;
+
+        var y = new Float64Array(n);
+        for (var j = 0; j < n; ++j) {
+          // Sum all cube vertices' samples portions
+          var rj = 0;
+          for (var i = 0; i < cubeVertices; i++)
+            rj += samples[cubeVertex[i] + j] * cubeN[i];
+
+          // r_j' = Interpolate(r_j, 0, 2^BitsPerSample - 1,
+          //                    Decode_2j, Decode_2j+1)
+          rj = interpolate(rj, 0, 1, decode[j][0], decode[j][1]);
+
+          // y_j = min(max(r_j, range_2j), range_2j+1)
+          y[j] = Math.min(Math.max(rj, range[j][0]), range[j][1]);
+        }
+
+        return y;
       }
     },
 
@@ -11120,6 +11347,11 @@ var ColorSpace = (function ColorSpaceClosure() {
 
         return new AlternateCS(numComps, ColorSpace.fromIR(alt),
                                 PDFFunction.fromIR(tintFnIR));
+      case 'LabCS':
+        var whitePoint = IR[1].WhitePoint;
+        var blackPoint = IR[1].BlackPoint;
+        var range = IR[1].Range;
+        return new LabCS(whitePoint, blackPoint, range);
       default:
         error('Unkown name ' + name);
     }
@@ -11209,6 +11441,8 @@ var ColorSpace = (function ColorSpaceClosure() {
           var tintFnIR = PDFFunction.getIR(xref, xref.fetchIfRef(cs[3]));
           return ['AlternateCS', numComps, alt, tintFnIR];
         case 'Lab':
+          var params = cs[1].map;
+          return ['LabCS', params];
         default:
           error('unimplemented color space object "' + mode + '"');
       }
@@ -11432,55 +11666,16 @@ var DeviceCmykCS = (function DeviceCmykCSClosure() {
   DeviceCmykCS.prototype = {
     getRgb: function cmykcs_getRgb(color) {
       var c = color[0], m = color[1], y = color[2], k = color[3];
-      var c1 = 1 - c, m1 = 1 - m, y1 = 1 - y, k1 = 1 - k;
 
-      var x, r, g, b;
-      // this is a matrix multiplication, unrolled for performance
-      // code is taken from the poppler implementation
-      x = c1 * m1 * y1 * k1; // 0 0 0 0
-      r = g = b = x;
-      x = c1 * m1 * y1 * k;  // 0 0 0 1
-      r += 0.1373 * x;
-      g += 0.1216 * x;
-      b += 0.1255 * x;
-      x = c1 * m1 * y * k1;  // 0 0 1 0
-      r += x;
-      g += 0.9490 * x;
-      x = c1 * m1 * y * k;   // 0 0 1 1
-      r += 0.1098 * x;
-      g += 0.1020 * x;
-      x = c1 * m * y1 * k1;  // 0 1 0 0
-      r += 0.9255 * x;
-      b += 0.5490 * x;
-      x = c1 * m * y1 * k;   // 0 1 0 1
-      r += 0.1412 * x;
-      x = c1 * m * y * k1;   // 0 1 1 0
-      r += 0.9294 * x;
-      g += 0.1098 * x;
-      b += 0.1412 * x;
-      x = c1 * m * y * k;    // 0 1 1 1
-      r += 0.1333 * x;
-      x = c * m1 * y1 * k1;  // 1 0 0 0
-      g += 0.6784 * x;
-      b += 0.9373 * x;
-      x = c * m1 * y1 * k;   // 1 0 0 1
-      g += 0.0588 * x;
-      b += 0.1412 * x;
-      x = c * m1 * y * k1;   // 1 0 1 0
-      g += 0.6510 * x;
-      b += 0.3137 * x;
-      x = c * m1 * y * k;    // 1 0 1 1
-      g += 0.0745 * x;
-      x = c * m * y1 * k1;   // 1 1 0 0
-      r += 0.1804 * x;
-      g += 0.1922 * x;
-      b += 0.5725 * x;
-      x = c * m * y1 * k;    // 1 1 0 1
-      b += 0.0078 * x;
-      x = c * m * y * k1;    // 1 1 1 0
-      r += 0.2118 * x;
-      g += 0.2119 * x;
-      b += 0.2235 * x;
+      // CMYK -> CMY: http://www.easyrgb.com/index.php?X=MATH&H=14#text14
+      c = (c * (1 - k) + k);
+      m = (m * (1 - k) + k);
+      y = (y * (1 - k) + k);
+
+      // CMY -> RGB: http://www.easyrgb.com/index.php?X=MATH&H=12#text12
+      var r = (1 - c);
+      var g = (1 - m);
+      var b = (1 - y);
 
       return [r, g, b];
     },
@@ -11511,6 +11706,119 @@ var DeviceCmykCS = (function DeviceCmykCSClosure() {
   return DeviceCmykCS;
 })();
 
+//
+// LabCS: Based on "PDF Reference, Sixth Ed", p.250
+//
+var LabCS = (function LabCSClosure() {
+  function LabCS(whitePoint, blackPoint, range) {
+    this.name = 'Lab';
+    this.numComps = 3;
+    this.defaultColor = [0, 0, 0];
+
+    if (!whitePoint)
+      error('WhitePoint missing - required for color space Lab');
+    blackPoint = blackPoint || [0, 0, 0];
+    range = range || [-100, 100, -100, 100];
+
+    // Translate args to spec variables
+    this.XW = whitePoint[0];
+    this.YW = whitePoint[1];
+    this.ZW = whitePoint[2];
+    this.amin = range[0];
+    this.amax = range[1];
+    this.bmin = range[2];
+    this.bmax = range[3];
+
+    // These are here just for completeness - the spec doesn't offer any
+    // formulas that use BlackPoint in Lab
+    this.XB = blackPoint[0];
+    this.YB = blackPoint[1];
+    this.ZB = blackPoint[2];
+
+    // Validate vars as per spec
+    if (this.XW < 0 || this.ZW < 0 || this.YW !== 1)
+      error('Invalid WhitePoint components, no fallback available');
+
+    if (this.XB < 0 || this.YB < 0 || this.ZB < 0) {
+      warn('Invalid BlackPoint, falling back to default');
+      this.XB = this.YB = this.ZB = 0;
+    }
+
+    if (this.amin > this.amax || this.bmin > this.bmax) {
+      warn('Invalid Range, falling back to defaults');
+      this.amin = -100;
+      this.amax = 100;
+      this.bmin = -100;
+      this.bmax = 100;
+    }
+  };
+
+  // Function g(x) from spec
+  function g(x) {
+    if (x >= 6 / 29)
+      return x * x * x;
+    else
+      return (108 / 841) * (x - 4 / 29);
+  }
+
+  LabCS.prototype = {
+    getRgb: function labcs_getRgb(color) {
+      // Ls,as,bs <---> L*,a*,b* in the spec
+      var Ls = color[0], as = color[1], bs = color[2];
+
+      // Adjust limits of 'as' and 'bs'
+      as = as > this.amax ? this.amax : as;
+      as = as < this.amin ? this.amin : as;
+      bs = bs > this.bmax ? this.bmax : bs;
+      bs = bs < this.bmin ? this.bmin : bs;
+
+      // Computes intermediate variables X,Y,Z as per spec
+      var M = (Ls + 16) / 116;
+      var L = M + (as / 500);
+      var N = M - (bs / 200);
+      var X = this.XW * g(L);
+      var Y = this.YW * g(M);
+      var Z = this.ZW * g(N);
+
+      // XYZ to RGB 3x3 matrix, from:
+      // http://www.poynton.com/notes/colour_and_gamma/ColorFAQ.html#RTFToC18
+      var XYZtoRGB = [3.240479, -1.537150, -0.498535,
+                      -0.969256, 1.875992, 0.041556,
+                      0.055648, -0.204043, 1.057311];
+
+      return Util.apply3dTransform(XYZtoRGB, [X, Y, Z]);
+    },
+    getRgbBuffer: function labcs_getRgbBuffer(input, bits) {
+      if (bits == 8)
+        return input;
+      var scale = 255 / ((1 << bits) - 1);
+      var i, length = input.length / 3;
+      var rgbBuf = new Uint8Array(length);
+
+      var j = 0;
+      for (i = 0; i < length; ++i) {
+        // Convert L*, a*, s* into RGB
+        var rgb = this.getRgb([input[i], input[i + 1], input[i + 2]]);
+        rgbBuf[j++] = rgb[0];
+        rgbBuf[j++] = rgb[1];
+        rgbBuf[j++] = rgb[2];
+      }
+
+      return rgbBuf;
+    },
+    isDefaultDecode: function labcs_isDefaultDecode(decodeMap) {
+      // From Table 90 in Adobe's:
+      // "Document management - Portable document format", 1st ed, 2008
+      if (decodeMap[0] === 0 && decodeMap[1] === 100 &&
+          decodeMap[2] === this.amin && decodeMap[3] === this.amax &&
+          decodeMap[4] === this.bmin && decodeMap[5] === this.bmax)
+        return true;
+      else
+        return false;
+    }
+  };
+  return LabCS;
+})();
 /* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 /* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
 
@@ -12269,6 +12577,10 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
             // a Stream in the main thread.
             if (translated.file)
               translated.file = translated.file.getBytes();
+            if (translated.properties.file) {
+              translated.properties.file =
+                  translated.properties.file.getBytes();
+            }
 
             handler.send('obj', [
                 loadedName,
@@ -12591,8 +12903,10 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
           properties.cidToGidMap = this.readCidToGidMap(cidToGidMap);
       }
 
+      var flags = properties.flags;
       var differences = [];
-      var baseEncoding = Encodings.StandardEncoding;
+      var baseEncoding = !!(flags & FontFlags.Symbolic) ?
+                         Encodings.symbolsEncoding : Encodings.StandardEncoding;
       var hasEncoding = dict.has('Encoding');
       if (hasEncoding) {
         var encoding = xref.fetchIfRef(dict.get('Encoding'));
@@ -12724,8 +13038,18 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
               } else {
                 // parsing hex UTF-16BE numbers
                 var str = [];
-                for (var i = 0, ii = token.length; i < ii; i += 4)
-                  str.push(parseInt(token.substr(i, 4), 16));
+                for (var k = 0, kk = token.length; k < kk; k += 4) {
+                  var b = parseInt(token.substr(k, 4), 16);
+                  if (b <= 0x10) {
+                    k += 4;
+                    b = (b << 16) | parseInt(token.substr(k, 4), 16);
+                    b -= 0x10000;
+                    str.push(0xD800 | (b >> 10));
+                    str.push(0xDC00 | (b & 0x3FF));
+                    break;
+                  }
+                  str.push(b);
+                }
                 tokens.push(String.fromCharCode.apply(String, str));
                 token = '';
               }
@@ -12871,8 +13195,9 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
           // Simulating descriptor flags attribute
           var fontNameWoStyle = baseFontName.split('-')[0];
           var flags = (serifFonts[fontNameWoStyle] ||
-            (fontNameWoStyle.search(/serif/gi) != -1) ? 2 : 0) |
-            (symbolsFonts[fontNameWoStyle] ? 4 : 32);
+            (fontNameWoStyle.search(/serif/gi) != -1) ? FontFlags.Serif : 0) |
+            (symbolsFonts[fontNameWoStyle] ? FontFlags.Symbolic :
+            FontFlags.Nonsymbolic);
 
           var properties = {
             type: type.name,
@@ -12890,11 +13215,10 @@ var PartialEvaluator = (function PartialEvaluatorClosure() {
             properties: properties
           };
         }
-
       }
 
       // According to the spec if 'FontDescriptor' is declared, 'FirstChar',
-      // 'LastChar' and 'Widths' should exists too, but some PDF encoders seems
+      // 'LastChar' and 'Widths' should exist too, but some PDF encoders seem
       // to ignore this rule when a variant of a standart font is used.
       // TODO Fill the width array depending on which of the base font this is
       // a variant.
@@ -13006,6 +13330,7 @@ var kMaxWaitForFontFace = 1000;
 // Unicode Private Use Area
 var kCmapGlyphOffset = 0xE000;
 var kSizeOfGlyphArea = 0x1900;
+var kSymbolicFontGlyphOffset = 0xF000;
 
 // PDF Glyph Space Units are one Thousandth of a TextSpace Unit
 // except for Type 3 fonts
@@ -13014,269 +13339,254 @@ var kPDFGlyphSpaceUnits = 1000;
 // Until hinting is fully supported this constant can be used
 var kHintingEnabled = false;
 
+var FontFlags = {
+  FixedPitch: 1,
+  Serif: 2,
+  Symbolic: 4,
+  Script: 8,
+  Nonsymbolic: 32,
+  Italic: 64,
+  AllCap: 65536,
+  SmallCap: 131072,
+  ForceBold: 262144
+};
+
 var Encodings = {
-  get ExpertEncoding() {
-    return shadow(this, 'ExpertEncoding', ['', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', 'space', 'exclamsmall', 'Hungarumlautsmall', '',
-      'dollaroldstyle', 'dollarsuperior', 'ampersandsmall', 'Acutesmall',
-      'parenleftsuperior', 'parenrightsuperior', 'twodotenleader',
-      'onedotenleader', 'comma', 'hyphen', 'period', 'fraction',
-      'zerooldstyle', 'oneoldstyle', 'twooldstyle', 'threeoldstyle',
-      'fouroldstyle', 'fiveoldstyle', 'sixoldstyle', 'sevenoldstyle',
-      'eightoldstyle', 'nineoldstyle', 'colon', 'semicolon', 'commasuperior',
-      'threequartersemdash', 'periodsuperior', 'questionsmall', '',
-      'asuperior', 'bsuperior', 'centsuperior', 'dsuperior', 'esuperior', '',
-      '', 'isuperior', '', '', 'lsuperior', 'msuperior', 'nsuperior',
-      'osuperior', '', '', 'rsuperior', 'ssuperior', 'tsuperior', '', 'ff',
-      'fi', 'fl', 'ffi', 'ffl', 'parenleftinferior', '', 'parenrightinferior',
-      'Circumflexsmall', 'hyphensuperior', 'Gravesmall', 'Asmall', 'Bsmall',
-      'Csmall', 'Dsmall', 'Esmall', 'Fsmall', 'Gsmall', 'Hsmall', 'Ismall',
-      'Jsmall', 'Ksmall', 'Lsmall', 'Msmall', 'Nsmall', 'Osmall', 'Psmall',
-      'Qsmall', 'Rsmall', 'Ssmall', 'Tsmall', 'Usmall', 'Vsmall', 'Wsmall',
-      'Xsmall', 'Ysmall', 'Zsmall', 'colonmonetary', 'onefitted', 'rupiah',
-      'Tildesmall', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', 'exclamdownsmall', 'centoldstyle', 'Lslashsmall', '', '',
-      'Scaronsmall', 'Zcaronsmall', 'Dieresissmall', 'Brevesmall',
-      'Caronsmall', '', 'Dotaccentsmall', '', '', 'Macronsmall', '', '',
-      'figuredash', 'hypheninferior', '', '', 'Ogoneksmall', 'Ringsmall',
-      'Cedillasmall', '', '', '', 'onequarter', 'onehalf', 'threequarters',
-      'questiondownsmall', 'oneeighth', 'threeeighths', 'fiveeighths',
-      'seveneighths', 'onethird', 'twothirds', '', '', 'zerosuperior',
-      'onesuperior', 'twosuperior', 'threesuperior', 'foursuperior',
-      'fivesuperior', 'sixsuperior', 'sevensuperior', 'eightsuperior',
-      'ninesuperior', 'zeroinferior', 'oneinferior', 'twoinferior',
-      'threeinferior', 'fourinferior', 'fiveinferior', 'sixinferior',
-      'seveninferior', 'eightinferior', 'nineinferior', 'centinferior',
-      'dollarinferior', 'periodinferior', 'commainferior', 'Agravesmall',
-      'Aacutesmall', 'Acircumflexsmall', 'Atildesmall', 'Adieresissmall',
-      'Aringsmall', 'AEsmall', 'Ccedillasmall', 'Egravesmall', 'Eacutesmall',
-      'Ecircumflexsmall', 'Edieresissmall', 'Igravesmall', 'Iacutesmall',
-      'Icircumflexsmall', 'Idieresissmall', 'Ethsmall', 'Ntildesmall',
-      'Ogravesmall', 'Oacutesmall', 'Ocircumflexsmall', 'Otildesmall',
-      'Odieresissmall', 'OEsmall', 'Oslashsmall', 'Ugravesmall', 'Uacutesmall',
-      'Ucircumflexsmall', 'Udieresissmall', 'Yacutesmall', 'Thornsmall',
-      'Ydieresissmall'
-    ]);
-  },
-  get MacExpertEncoding() {
-    return shadow(this, 'MacExpertEncoding', ['', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', 'space', 'exclamsmall', 'Hungarumlautsmall',
-      'centoldstyle', 'dollaroldstyle', 'dollarsuperior', 'ampersandsmall',
-      'Acutesmall', 'parenleftsuperior', 'parenrightsuperior',
-      'twodotenleader', 'onedotenleader', 'comma', 'hyphen', 'period',
-      'fraction', 'zerooldstyle', 'oneoldstyle', 'twooldstyle',
-      'threeoldstyle', 'fouroldstyle', 'fiveoldstyle', 'sixoldstyle',
-      'sevenoldstyle', 'eightoldstyle', 'nineoldstyle', 'colon', 'semicolon',
-      '', 'threequartersemdash', '', 'questionsmall', '', '', '', '',
-      'Ethsmall', '', '', 'onequarter', 'onehalf', 'threequarters',
-      'oneeighth', 'threeeighths', 'fiveeighths', 'seveneighths', 'onethird',
-      'twothirds', '', '', '', '', '', '', 'ff', 'fi', 'fl', 'ffi', 'ffl',
-      'parenleftinferior', '', 'parenrightinferior', 'Circumflexsmall',
-      'hypheninferior', 'Gravesmall', 'Asmall', 'Bsmall', 'Csmall', 'Dsmall',
-      'Esmall', 'Fsmall', 'Gsmall', 'Hsmall', 'Ismall', 'Jsmall', 'Ksmall',
-      'Lsmall', 'Msmall', 'Nsmall', 'Osmall', 'Psmall', 'Qsmall', 'Rsmall',
-      'Ssmall', 'Tsmall', 'Usmall', 'Vsmall', 'Wsmall', 'Xsmall', 'Ysmall',
-      'Zsmall', 'colonmonetary', 'onefitted', 'rupiah', 'Tildesmall', '', '',
-      'asuperior', 'centsuperior', '', '', '', '', 'Aacutesmall',
-      'Agravesmall', 'Acircumflexsmall', 'Adieresissmall', 'Atildesmall',
-      'Aringsmall', 'Ccedillasmall', 'Eacutesmall', 'Egravesmall',
-      'Ecircumflexsmall', 'Edieresissmall', 'Iacutesmall', 'Igravesmall',
-      'Icircumflexsmall', 'Idieresissmall', 'Ntildesmall', 'Oacutesmall',
-      'Ogravesmall', 'Ocircumflexsmall', 'Odieresissmall', 'Otildesmall',
-      'Uacutesmall', 'Ugravesmall', 'Ucircumflexsmall', 'Udieresissmall', '',
-      'eightsuperior', 'fourinferior', 'threeinferior', 'sixinferior',
-      'eightinferior', 'seveninferior', 'Scaronsmall', '', 'centinferior',
-      'twoinferior', '', 'Dieresissmall', '', 'Caronsmall', 'osuperior',
-      'fiveinferior', '', 'commainferior', 'periodinferior', 'Yacutesmall', '',
-      'dollarinferior', '', 'Thornsmall', '', 'nineinferior', 'zeroinferior',
-      'Zcaronsmall', 'AEsmall', 'Oslashsmall', 'questiondownsmall',
-      'oneinferior', 'Lslashsmall', '', '', '', '', '', '', 'Cedillasmall', '',
-      '', '', '', '', 'OEsmall', 'figuredash', 'hyphensuperior', '', '', '',
-      '', 'exclamdownsmall', '', 'Ydieresissmall', '', 'onesuperior',
-      'twosuperior', 'threesuperior', 'foursuperior', 'fivesuperior',
-      'sixsuperior', 'sevensuperior', 'ninesuperior', 'zerosuperior', '',
-      'esuperior', 'rsuperior', 'tsuperior', '', '', 'isuperior', 'ssuperior',
-      'dsuperior', '', '', '', '', '', 'lsuperior', 'Ogoneksmall',
-      'Brevesmall', 'Macronsmall', 'bsuperior', 'nsuperior', 'msuperior',
-      'commasuperior', 'periodsuperior', 'Dotaccentsmall', 'Ringsmall'
-    ]);
-  },
-  get MacRomanEncoding() {
-    return shadow(this, 'MacRomanEncoding', ['', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', 'space', 'exclam', 'quotedbl', 'numbersign',
-      'dollar', 'percent', 'ampersand', 'quotesingle', 'parenleft',
-      'parenright', 'asterisk', 'plus', 'comma', 'hyphen', 'period', 'slash',
-      'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
-      'nine', 'colon', 'semicolon', 'less', 'equal', 'greater', 'question',
-      'at', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
-      'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-      'bracketleft', 'backslash', 'bracketright', 'asciicircum', 'underscore',
-      'grave', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
-      'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-      'braceleft', 'bar', 'braceright', 'asciitilde', '', 'Adieresis', 'Aring',
-      'Ccedilla', 'Eacute', 'Ntilde', 'Odieresis', 'Udieresis', 'aacute',
-      'agrave', 'acircumflex', 'adieresis', 'atilde', 'aring', 'ccedilla',
-      'eacute', 'egrave', 'ecircumflex', 'edieresis', 'iacute', 'igrave',
-      'icircumflex', 'idieresis', 'ntilde', 'oacute', 'ograve', 'ocircumflex',
-      'odieresis', 'otilde', 'uacute', 'ugrave', 'ucircumflex', 'udieresis',
-      'dagger', 'degree', 'cent', 'sterling', 'section', 'bullet', 'paragraph',
-      'germandbls', 'registered', 'copyright', 'trademark', 'acute',
-      'dieresis', 'notequal', 'AE', 'Oslash', 'infinity', 'plusminus',
-      'lessequal', 'greaterequal', 'yen', 'mu', 'partialdiff', 'summation',
-      'product', 'pi', 'integral', 'ordfeminine', 'ordmasculine', 'Omega',
-      'ae', 'oslash', 'questiondown', 'exclamdown', 'logicalnot', 'radical',
-      'florin', 'approxequal', 'Delta', 'guillemotleft', 'guillemotright',
-      'ellipsis', 'space', 'Agrave', 'Atilde', 'Otilde', 'OE', 'oe', 'endash',
-      'emdash', 'quotedblleft', 'quotedblright', 'quoteleft', 'quoteright',
-      'divide', 'lozenge', 'ydieresis', 'Ydieresis', 'fraction', 'currency',
-      'guilsinglleft', 'guilsinglright', 'fi', 'fl', 'daggerdbl',
-      'periodcentered', 'quotesinglbase', 'quotedblbase', 'perthousand',
-      'Acircumflex', 'Ecircumflex', 'Aacute', 'Edieresis', 'Egrave', 'Iacute',
-      'Icircumflex', 'Idieresis', 'Igrave', 'Oacute', 'Ocircumflex', 'apple',
-      'Ograve', 'Uacute', 'Ucircumflex', 'Ugrave', 'dotlessi', 'circumflex',
-      'tilde', 'macron', 'breve', 'dotaccent', 'ring', 'cedilla',
-      'hungarumlaut', 'ogonek', 'caron'
-    ]);
-  },
-  get StandardEncoding() {
-    return shadow(this, 'StandardEncoding', ['', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', 'space', 'exclam', 'quotedbl', 'numbersign',
-      'dollar', 'percent', 'ampersand', 'quoteright', 'parenleft',
-      'parenright', 'asterisk', 'plus', 'comma', 'hyphen', 'period', 'slash',
-      'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
-      'nine', 'colon', 'semicolon', 'less', 'equal', 'greater', 'question',
-      'at', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
-      'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-      'bracketleft', 'backslash', 'bracketright', 'asciicircum', 'underscore',
-      'quoteleft', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
-      'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-      'braceleft', 'bar', 'braceright', 'asciitilde', '', '', 'exclamdown',
-      'cent', 'sterling', 'fraction', 'yen', 'florin', 'section', 'currency',
-      'quotesingle', 'quotedblleft', 'guillemotleft', 'guilsinglleft',
-      'guilsinglright', 'fi', 'fl', '', 'endash', 'dagger', 'daggerdbl',
-      'periodcentered', '', 'paragraph', 'bullet', 'quotesinglbase',
-      'quotedblbase', 'quotedblright', 'guillemotright', 'ellipsis',
-      'perthousand', '', 'questiondown', '', 'grave', 'acute', 'circumflex',
-      'tilde', 'macron', 'breve', 'dotaccent', 'dieresis', '', 'ring',
-      'cedilla', '', 'hungarumlaut', 'ogonek', 'caron', 'emdash', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', 'AE', '',
-      'ordfeminine', '', '', '', '', 'Lslash', 'Oslash', 'OE', 'ordmasculine',
-      '', '', '', '', '', 'ae', '', '', '', 'dotlessi', '', '', 'lslash',
-      'oslash', 'oe', 'germandbls'
-    ]);
-  },
-  get WinAnsiEncoding() {
-    return shadow(this, 'WinAnsiEncoding', ['', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', 'space', 'exclam', 'quotedbl', 'numbersign',
-      'dollar', 'percent', 'ampersand', 'quotesingle', 'parenleft',
-      'parenright', 'asterisk', 'plus', 'comma', 'hyphen', 'period', 'slash',
-      'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight',
-      'nine', 'colon', 'semicolon', 'less', 'equal', 'greater', 'question',
-      'at', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
-      'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-      'bracketleft', 'backslash', 'bracketright', 'asciicircum', 'underscore',
-      'grave', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
-      'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
-      'braceleft', 'bar', 'braceright', 'asciitilde', 'bullet', 'Euro',
-      'bullet', 'quotesinglbase', 'florin', 'quotedblbase', 'ellipsis',
-      'dagger', 'daggerdbl', 'circumflex', 'perthousand', 'Scaron',
-      'guilsinglleft', 'OE', 'bullet', 'Zcaron', 'bullet', 'bullet',
-      'quoteleft', 'quoteright', 'quotedblleft', 'quotedblright', 'bullet',
-      'endash', 'emdash', 'tilde', 'trademark', 'scaron', 'guilsinglright',
-      'oe', 'bullet', 'zcaron', 'Ydieresis', 'space', 'exclamdown', 'cent',
-      'sterling', 'currency', 'yen', 'brokenbar', 'section', 'dieresis',
-      'copyright', 'ordfeminine', 'guillemotleft', 'logicalnot', 'hyphen',
-      'registered', 'macron', 'degree', 'plusminus', 'twosuperior',
-      'threesuperior', 'acute', 'mu', 'paragraph', 'periodcentered',
-      'cedilla', 'onesuperior', 'ordmasculine', 'guillemotright', 'onequarter',
-      'onehalf', 'threequarters', 'questiondown', 'Agrave', 'Aacute',
-      'Acircumflex', 'Atilde', 'Adieresis', 'Aring', 'AE', 'Ccedilla',
-      'Egrave', 'Eacute', 'Ecircumflex', 'Edieresis', 'Igrave', 'Iacute',
-      'Icircumflex', 'Idieresis', 'Eth', 'Ntilde', 'Ograve', 'Oacute',
-      'Ocircumflex', 'Otilde', 'Odieresis', 'multiply', 'Oslash', 'Ugrave',
-      'Uacute', 'Ucircumflex', 'Udieresis', 'Yacute', 'Thorn', 'germandbls',
-      'agrave', 'aacute', 'acircumflex', 'atilde', 'adieresis', 'aring', 'ae',
-      'ccedilla', 'egrave', 'eacute', 'ecircumflex', 'edieresis', 'igrave',
-      'iacute', 'icircumflex', 'idieresis', 'eth', 'ntilde', 'ograve',
-      'oacute', 'ocircumflex', 'otilde', 'odieresis', 'divide', 'oslash',
-      'ugrave', 'uacute', 'ucircumflex', 'udieresis', 'yacute', 'thorn',
-      'ydieresis'
-    ]);
-  },
-  get symbolsEncoding() {
-    return shadow(this, 'symbolsEncoding', ['', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', 'space', 'exclam', 'universal', 'numbersign',
-      'existential', 'percent', 'ampersand', 'suchthat', 'parenleft',
-      'parenright', 'asteriskmath', 'plus', 'comma', 'minus', 'period',
-      'slash', 'zero', 'one', 'two', 'three', 'four', 'five', 'six', 'seven',
-      'eight', 'nine', 'colon', 'semicolon', 'less', 'equal', 'greater',
-      'question', 'congruent', 'Alpha', 'Beta', 'Chi', 'Delta', 'Epsilon',
-      'Phi', 'Gamma', 'Eta', 'Iota', 'theta1', 'Kappa', 'Lambda', 'Mu', 'Nu',
-      'Omicron', 'Pi', 'Theta', 'Rho', 'Sigma', 'Tau', 'Upsilon', 'sigma1',
-      'Omega', 'Xi', 'Psi', 'Zeta', 'bracketleft', 'therefore', 'bracketright',
-      'perpendicular', 'underscore', 'radicalex', 'alpha', 'beta', 'chi',
-      'delta', 'epsilon', 'phi', 'gamma', 'eta', 'iota', 'phi1', 'kappa',
-      'lambda', 'mu', 'nu', 'omicron', 'pi', 'theta', 'rho', 'sigma', 'tau',
-      'upsilon', 'omega1', 'omega', 'xi', 'psi', 'zeta', 'braceleft', 'bar',
-      'braceright', 'similar', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', 'Euro', 'Upsilon1', 'minute', 'lessequal', 'fraction',
-      'infinity', 'florin', 'club', 'diamond', 'heart', 'spade', 'arrowboth',
-      'arrowleft', 'arrowup', 'arrowright', 'arrowdown', 'degree', 'plusminus',
-      'second', 'greaterequal', 'multiply', 'proportional', 'partialdiff',
-      'bullet', 'divide', 'notequal', 'equivalence', 'approxequal', 'ellipsis',
-      'arrowvertex', 'arrowhorizex', 'carriagereturn', 'aleph', 'Ifraktur',
-      'Rfraktur', 'weierstrass', 'circlemultiply', 'circleplus', 'emptyset',
-      'intersection', 'union', 'propersuperset', 'reflexsuperset', 'notsubset',
-      'propersubset', 'reflexsubset', 'element', 'notelement', 'angle',
-      'gradient', 'registerserif', 'copyrightserif', 'trademarkserif',
-      'product', 'radical', 'dotmath', 'logicalnot', 'logicaland', 'logicalor',
-      'arrowdblboth', 'arrowdblleft', 'arrowdblup', 'arrowdblright',
-      'arrowdbldown', 'lozenge', 'angleleft', 'registersans', 'copyrightsans',
-      'trademarksans', 'summation', 'parenlefttp', 'parenleftex',
-      'parenleftbt', 'bracketlefttp', 'bracketleftex', 'bracketleftbt',
-      'bracelefttp', 'braceleftmid', 'braceleftbt', 'braceex', '',
-      'angleright', 'integral', 'integraltp', 'integralex', 'integralbt',
-      'parenrighttp', 'parenrightex', 'parenrightbt', 'bracketrighttp',
-      'bracketrightex', 'bracketrightbt', 'bracerighttp', 'bracerightmid',
-      'bracerightbt'
-    ]);
-  },
-  get zapfDingbatsEncoding() {
-    return shadow(this, 'zapfDingbatsEncoding', ['', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', 'space', 'a1', 'a2', 'a202', 'a3', 'a4',
-      'a5', 'a119', 'a118', 'a117', 'a11', 'a12', 'a13', 'a14', 'a15', 'a16',
-      'a105', 'a17', 'a18', 'a19', 'a20', 'a21', 'a22', 'a23', 'a24', 'a25',
-      'a26', 'a27', 'a28', 'a6', 'a7', 'a8', 'a9', 'a10', 'a29', 'a30', 'a31',
-      'a32', 'a33', 'a34', 'a35', 'a36', 'a37', 'a38', 'a39', 'a40', 'a41',
-      'a42', 'a43', 'a44', 'a45', 'a46', 'a47', 'a48', 'a49', 'a50', 'a51',
-      'a52', 'a53', 'a54', 'a55', 'a56', 'a57', 'a58', 'a59', 'a60', 'a61',
-      'a62', 'a63', 'a64', 'a65', 'a66', 'a67', 'a68', 'a69', 'a70', 'a71',
-      'a72', 'a73', 'a74', 'a203', 'a75', 'a204', 'a76', 'a77', 'a78', 'a79',
-      'a81', 'a82', 'a83', 'a84', 'a97', 'a98', 'a99', 'a100', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
-      '', '', '', '', '', '', '', '', '', '', '', '', 'a101', 'a102', 'a103',
-      'a104', 'a106', 'a107', 'a108', 'a112', 'a111', 'a110', 'a109', 'a120',
-      'a121', 'a122', 'a123', 'a124', 'a125', 'a126', 'a127', 'a128', 'a129',
-      'a130', 'a131', 'a132', 'a133', 'a134', 'a135', 'a136', 'a137', 'a138',
-      'a139', 'a140', 'a141', 'a142', 'a143', 'a144', 'a145', 'a146', 'a147',
-      'a148', 'a149', 'a150', 'a151', 'a152', 'a153', 'a154', 'a155', 'a156',
-      'a157', 'a158', 'a159', 'a160', 'a161', 'a163', 'a164', 'a196', 'a165',
-      'a192', 'a166', 'a167', 'a168', 'a169', 'a170', 'a171', 'a172', 'a173',
-      'a162', 'a174', 'a175', 'a176', 'a177', 'a178', 'a179', 'a193', 'a180',
-      'a199', 'a181', 'a200', 'a182', '', 'a201', 'a183', 'a184', 'a197',
-      'a185', 'a194', 'a198', 'a186', 'a195', 'a187', 'a188', 'a189', 'a190',
-      'a191'
-    ]);
-  }
+  ExpertEncoding: ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'space', 'exclamsmall', 'Hungarumlautsmall', '', 'dollaroldstyle',
+    'dollarsuperior', 'ampersandsmall', 'Acutesmall', 'parenleftsuperior',
+    'parenrightsuperior', 'twodotenleader', 'onedotenleader', 'comma',
+    'hyphen', 'period', 'fraction', 'zerooldstyle', 'oneoldstyle',
+    'twooldstyle', 'threeoldstyle', 'fouroldstyle', 'fiveoldstyle',
+    'sixoldstyle', 'sevenoldstyle', 'eightoldstyle', 'nineoldstyle', 'colon',
+    'semicolon', 'commasuperior', 'threequartersemdash', 'periodsuperior',
+    'questionsmall', '', 'asuperior', 'bsuperior', 'centsuperior', 'dsuperior',
+    'esuperior', '', '', 'isuperior', '', '', 'lsuperior', 'msuperior',
+    'nsuperior', 'osuperior', '', '', 'rsuperior', 'ssuperior', 'tsuperior',
+    '', 'ff', 'fi', 'fl', 'ffi', 'ffl', 'parenleftinferior', '',
+    'parenrightinferior', 'Circumflexsmall', 'hyphensuperior', 'Gravesmall',
+    'Asmall', 'Bsmall', 'Csmall', 'Dsmall', 'Esmall', 'Fsmall', 'Gsmall',
+    'Hsmall', 'Ismall', 'Jsmall', 'Ksmall', 'Lsmall', 'Msmall', 'Nsmall',
+    'Osmall', 'Psmall', 'Qsmall', 'Rsmall', 'Ssmall', 'Tsmall', 'Usmall',
+    'Vsmall', 'Wsmall', 'Xsmall', 'Ysmall', 'Zsmall', 'colonmonetary',
+    'onefitted', 'rupiah', 'Tildesmall', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', 'exclamdownsmall', 'centoldstyle', 'Lslashsmall',
+    '', '', 'Scaronsmall', 'Zcaronsmall', 'Dieresissmall', 'Brevesmall',
+    'Caronsmall', '', 'Dotaccentsmall', '', '', 'Macronsmall', '', '',
+    'figuredash', 'hypheninferior', '', '', 'Ogoneksmall', 'Ringsmall',
+    'Cedillasmall', '', '', '', 'onequarter', 'onehalf', 'threequarters',
+    'questiondownsmall', 'oneeighth', 'threeeighths', 'fiveeighths',
+    'seveneighths', 'onethird', 'twothirds', '', '', 'zerosuperior',
+    'onesuperior', 'twosuperior', 'threesuperior', 'foursuperior',
+    'fivesuperior', 'sixsuperior', 'sevensuperior', 'eightsuperior',
+    'ninesuperior', 'zeroinferior', 'oneinferior', 'twoinferior',
+    'threeinferior', 'fourinferior', 'fiveinferior', 'sixinferior',
+    'seveninferior', 'eightinferior', 'nineinferior', 'centinferior',
+    'dollarinferior', 'periodinferior', 'commainferior', 'Agravesmall',
+    'Aacutesmall', 'Acircumflexsmall', 'Atildesmall', 'Adieresissmall',
+    'Aringsmall', 'AEsmall', 'Ccedillasmall', 'Egravesmall', 'Eacutesmall',
+    'Ecircumflexsmall', 'Edieresissmall', 'Igravesmall', 'Iacutesmall',
+    'Icircumflexsmall', 'Idieresissmall', 'Ethsmall', 'Ntildesmall',
+    'Ogravesmall', 'Oacutesmall', 'Ocircumflexsmall', 'Otildesmall',
+    'Odieresissmall', 'OEsmall', 'Oslashsmall', 'Ugravesmall', 'Uacutesmall',
+    'Ucircumflexsmall', 'Udieresissmall', 'Yacutesmall', 'Thornsmall',
+    'Ydieresissmall'],
+  MacExpertEncoding: ['', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'space', 'exclamsmall', 'Hungarumlautsmall', 'centoldstyle',
+    'dollaroldstyle', 'dollarsuperior', 'ampersandsmall', 'Acutesmall',
+    'parenleftsuperior', 'parenrightsuperior', 'twodotenleader',
+    'onedotenleader', 'comma', 'hyphen', 'period', 'fraction', 'zerooldstyle',
+    'oneoldstyle', 'twooldstyle', 'threeoldstyle', 'fouroldstyle',
+    'fiveoldstyle', 'sixoldstyle', 'sevenoldstyle', 'eightoldstyle',
+    'nineoldstyle', 'colon', 'semicolon', '', 'threequartersemdash', '',
+    'questionsmall', '', '', '', '', 'Ethsmall', '', '', 'onequarter',
+    'onehalf', 'threequarters', 'oneeighth', 'threeeighths', 'fiveeighths',
+    'seveneighths', 'onethird', 'twothirds', '', '', '', '', '', '', 'ff',
+    'fi', 'fl', 'ffi', 'ffl', 'parenleftinferior', '', 'parenrightinferior',
+    'Circumflexsmall', 'hypheninferior', 'Gravesmall', 'Asmall', 'Bsmall',
+    'Csmall', 'Dsmall', 'Esmall', 'Fsmall', 'Gsmall', 'Hsmall', 'Ismall',
+    'Jsmall', 'Ksmall', 'Lsmall', 'Msmall', 'Nsmall', 'Osmall', 'Psmall',
+    'Qsmall', 'Rsmall', 'Ssmall', 'Tsmall', 'Usmall', 'Vsmall', 'Wsmall',
+    'Xsmall', 'Ysmall', 'Zsmall', 'colonmonetary', 'onefitted', 'rupiah',
+    'Tildesmall', '', '', 'asuperior', 'centsuperior', '', '', '', '',
+    'Aacutesmall', 'Agravesmall', 'Acircumflexsmall', 'Adieresissmall',
+    'Atildesmall', 'Aringsmall', 'Ccedillasmall', 'Eacutesmall', 'Egravesmall',
+    'Ecircumflexsmall', 'Edieresissmall', 'Iacutesmall', 'Igravesmall',
+    'Icircumflexsmall', 'Idieresissmall', 'Ntildesmall', 'Oacutesmall',
+    'Ogravesmall', 'Ocircumflexsmall', 'Odieresissmall', 'Otildesmall',
+    'Uacutesmall', 'Ugravesmall', 'Ucircumflexsmall', 'Udieresissmall', '',
+    'eightsuperior', 'fourinferior', 'threeinferior', 'sixinferior',
+    'eightinferior', 'seveninferior', 'Scaronsmall', '', 'centinferior',
+    'twoinferior', '', 'Dieresissmall', '', 'Caronsmall', 'osuperior',
+    'fiveinferior', '', 'commainferior', 'periodinferior', 'Yacutesmall', '',
+    'dollarinferior', '', 'Thornsmall', '', 'nineinferior', 'zeroinferior',
+    'Zcaronsmall', 'AEsmall', 'Oslashsmall', 'questiondownsmall',
+    'oneinferior', 'Lslashsmall', '', '', '', '', '', '', 'Cedillasmall', '',
+    '', '', '', '', 'OEsmall', 'figuredash', 'hyphensuperior', '', '', '', '',
+    'exclamdownsmall', '', 'Ydieresissmall', '', 'onesuperior', 'twosuperior',
+    'threesuperior', 'foursuperior', 'fivesuperior', 'sixsuperior',
+    'sevensuperior', 'ninesuperior', 'zerosuperior', '', 'esuperior',
+    'rsuperior', 'tsuperior', '', '', 'isuperior', 'ssuperior', 'dsuperior',
+    '', '', '', '', '', 'lsuperior', 'Ogoneksmall', 'Brevesmall',
+    'Macronsmall', 'bsuperior', 'nsuperior', 'msuperior', 'commasuperior',
+    'periodsuperior', 'Dotaccentsmall', 'Ringsmall'],
+  MacRomanEncoding: ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'space', 'exclam', 'quotedbl', 'numbersign', 'dollar', 'percent',
+    'ampersand', 'quotesingle', 'parenleft', 'parenright', 'asterisk', 'plus',
+    'comma', 'hyphen', 'period', 'slash', 'zero', 'one', 'two', 'three',
+    'four', 'five', 'six', 'seven', 'eight', 'nine', 'colon', 'semicolon',
+    'less', 'equal', 'greater', 'question', 'at', 'A', 'B', 'C', 'D', 'E', 'F',
+    'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z', 'bracketleft', 'backslash', 'bracketright',
+    'asciicircum', 'underscore', 'grave', 'a', 'b', 'c', 'd', 'e', 'f', 'g',
+    'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z', 'braceleft', 'bar', 'braceright', 'asciitilde', '',
+    'Adieresis', 'Aring', 'Ccedilla', 'Eacute', 'Ntilde', 'Odieresis',
+    'Udieresis', 'aacute', 'agrave', 'acircumflex', 'adieresis', 'atilde',
+    'aring', 'ccedilla', 'eacute', 'egrave', 'ecircumflex', 'edieresis',
+    'iacute', 'igrave', 'icircumflex', 'idieresis', 'ntilde', 'oacute',
+    'ograve', 'ocircumflex', 'odieresis', 'otilde', 'uacute', 'ugrave',
+    'ucircumflex', 'udieresis', 'dagger', 'degree', 'cent', 'sterling',
+    'section', 'bullet', 'paragraph', 'germandbls', 'registered', 'copyright',
+    'trademark', 'acute', 'dieresis', 'notequal', 'AE', 'Oslash', 'infinity',
+    'plusminus', 'lessequal', 'greaterequal', 'yen', 'mu', 'partialdiff',
+    'summation', 'product', 'pi', 'integral', 'ordfeminine', 'ordmasculine',
+    'Omega', 'ae', 'oslash', 'questiondown', 'exclamdown', 'logicalnot',
+    'radical', 'florin', 'approxequal', 'Delta', 'guillemotleft',
+    'guillemotright', 'ellipsis', 'space', 'Agrave', 'Atilde', 'Otilde', 'OE',
+    'oe', 'endash', 'emdash', 'quotedblleft', 'quotedblright', 'quoteleft',
+    'quoteright', 'divide', 'lozenge', 'ydieresis', 'Ydieresis', 'fraction',
+    'currency', 'guilsinglleft', 'guilsinglright', 'fi', 'fl', 'daggerdbl',
+    'periodcentered', 'quotesinglbase', 'quotedblbase', 'perthousand',
+    'Acircumflex', 'Ecircumflex', 'Aacute', 'Edieresis', 'Egrave', 'Iacute',
+    'Icircumflex', 'Idieresis', 'Igrave', 'Oacute', 'Ocircumflex', 'apple',
+    'Ograve', 'Uacute', 'Ucircumflex', 'Ugrave', 'dotlessi', 'circumflex',
+    'tilde', 'macron', 'breve', 'dotaccent', 'ring', 'cedilla', 'hungarumlaut',
+    'ogonek', 'caron'],
+  StandardEncoding: ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'space', 'exclam', 'quotedbl', 'numbersign', 'dollar', 'percent',
+    'ampersand', 'quoteright', 'parenleft', 'parenright', 'asterisk', 'plus',
+    'comma', 'hyphen', 'period', 'slash', 'zero', 'one', 'two', 'three',
+    'four', 'five', 'six', 'seven', 'eight', 'nine', 'colon', 'semicolon',
+    'less', 'equal', 'greater', 'question', 'at', 'A', 'B', 'C', 'D', 'E', 'F',
+    'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z', 'bracketleft', 'backslash', 'bracketright',
+    'asciicircum', 'underscore', 'quoteleft', 'a', 'b', 'c', 'd', 'e', 'f',
+    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u',
+    'v', 'w', 'x', 'y', 'z', 'braceleft', 'bar', 'braceright', 'asciitilde',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 'exclamdown',
+    'cent', 'sterling', 'fraction', 'yen', 'florin', 'section', 'currency',
+    'quotesingle', 'quotedblleft', 'guillemotleft', 'guilsinglleft',
+    'guilsinglright', 'fi', 'fl', '', 'endash', 'dagger', 'daggerdbl',
+    'periodcentered', '', 'paragraph', 'bullet', 'quotesinglbase',
+    'quotedblbase', 'quotedblright', 'guillemotright', 'ellipsis',
+    'perthousand', '', 'questiondown', '', 'grave', 'acute', 'circumflex',
+    'tilde', 'macron', 'breve', 'dotaccent', 'dieresis', '', 'ring', 'cedilla',
+    '', 'hungarumlaut', 'ogonek', 'caron', 'emdash', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', 'AE', '', 'ordfeminine', '', '',
+    '', '', 'Lslash', 'Oslash', 'OE', 'ordmasculine', '', '', '', '', '', 'ae',
+    '', '', '', 'dotlessi', '', '', 'lslash', 'oslash', 'oe', 'germandbls'],
+  WinAnsiEncoding: ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'space', 'exclam', 'quotedbl', 'numbersign', 'dollar', 'percent',
+    'ampersand', 'quotesingle', 'parenleft', 'parenright', 'asterisk', 'plus',
+    'comma', 'hyphen', 'period', 'slash', 'zero', 'one', 'two', 'three',
+    'four', 'five', 'six', 'seven', 'eight', 'nine', 'colon', 'semicolon',
+    'less', 'equal', 'greater', 'question', 'at', 'A', 'B', 'C', 'D', 'E', 'F',
+    'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
+    'V', 'W', 'X', 'Y', 'Z', 'bracketleft', 'backslash', 'bracketright',
+    'asciicircum', 'underscore', 'grave', 'a', 'b', 'c', 'd', 'e', 'f', 'g',
+    'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+    'w', 'x', 'y', 'z', 'braceleft', 'bar', 'braceright', 'asciitilde',
+    'bullet', 'Euro', 'bullet', 'quotesinglbase', 'florin', 'quotedblbase',
+    'ellipsis', 'dagger', 'daggerdbl', 'circumflex', 'perthousand', 'Scaron',
+    'guilsinglleft', 'OE', 'bullet', 'Zcaron', 'bullet', 'bullet', 'quoteleft',
+    'quoteright', 'quotedblleft', 'quotedblright', 'bullet', 'endash',
+    'emdash', 'tilde', 'trademark', 'scaron', 'guilsinglright', 'oe', 'bullet',
+    'zcaron', 'Ydieresis', 'space', 'exclamdown', 'cent', 'sterling',
+    'currency', 'yen', 'brokenbar', 'section', 'dieresis', 'copyright',
+    'ordfeminine', 'guillemotleft', 'logicalnot', 'hyphen', 'registered',
+    'macron', 'degree', 'plusminus', 'twosuperior', 'threesuperior', 'acute',
+    'mu', 'paragraph', 'periodcentered', 'cedilla', 'onesuperior',
+    'ordmasculine', 'guillemotright', 'onequarter', 'onehalf', 'threequarters',
+    'questiondown', 'Agrave', 'Aacute', 'Acircumflex', 'Atilde', 'Adieresis',
+    'Aring', 'AE', 'Ccedilla', 'Egrave', 'Eacute', 'Ecircumflex', 'Edieresis',
+    'Igrave', 'Iacute', 'Icircumflex', 'Idieresis', 'Eth', 'Ntilde', 'Ograve',
+    'Oacute', 'Ocircumflex', 'Otilde', 'Odieresis', 'multiply', 'Oslash',
+    'Ugrave', 'Uacute', 'Ucircumflex', 'Udieresis', 'Yacute', 'Thorn',
+    'germandbls', 'agrave', 'aacute', 'acircumflex', 'atilde', 'adieresis',
+    'aring', 'ae', 'ccedilla', 'egrave', 'eacute', 'ecircumflex', 'edieresis',
+    'igrave', 'iacute', 'icircumflex', 'idieresis', 'eth', 'ntilde', 'ograve',
+    'oacute', 'ocircumflex', 'otilde', 'odieresis', 'divide', 'oslash',
+    'ugrave', 'uacute', 'ucircumflex', 'udieresis', 'yacute', 'thorn',
+    'ydieresis'],
+  symbolsEncoding: ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'space', 'exclam', 'universal', 'numbersign', 'existential', 'percent',
+    'ampersand', 'suchthat', 'parenleft', 'parenright', 'asteriskmath', 'plus',
+    'comma', 'minus', 'period', 'slash', 'zero', 'one', 'two', 'three', 'four',
+    'five', 'six', 'seven', 'eight', 'nine', 'colon', 'semicolon', 'less',
+    'equal', 'greater', 'question', 'congruent', 'Alpha', 'Beta', 'Chi',
+    'Delta', 'Epsilon', 'Phi', 'Gamma', 'Eta', 'Iota', 'theta1', 'Kappa',
+    'Lambda', 'Mu', 'Nu', 'Omicron', 'Pi', 'Theta', 'Rho', 'Sigma', 'Tau',
+    'Upsilon', 'sigma1', 'Omega', 'Xi', 'Psi', 'Zeta', 'bracketleft',
+    'therefore', 'bracketright', 'perpendicular', 'underscore', 'radicalex',
+    'alpha', 'beta', 'chi', 'delta', 'epsilon', 'phi', 'gamma', 'eta', 'iota',
+    'phi1', 'kappa', 'lambda', 'mu', 'nu', 'omicron', 'pi', 'theta', 'rho',
+    'sigma', 'tau', 'upsilon', 'omega1', 'omega', 'xi', 'psi', 'zeta',
+    'braceleft', 'bar', 'braceright', 'similar', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', 'Euro', 'Upsilon1', 'minute', 'lessequal',
+    'fraction', 'infinity', 'florin', 'club', 'diamond', 'heart', 'spade',
+    'arrowboth', 'arrowleft', 'arrowup', 'arrowright', 'arrowdown', 'degree',
+    'plusminus', 'second', 'greaterequal', 'multiply', 'proportional',
+    'partialdiff', 'bullet', 'divide', 'notequal', 'equivalence',
+    'approxequal', 'ellipsis', 'arrowvertex', 'arrowhorizex', 'carriagereturn',
+    'aleph', 'Ifraktur', 'Rfraktur', 'weierstrass', 'circlemultiply',
+    'circleplus', 'emptyset', 'intersection', 'union', 'propersuperset',
+    'reflexsuperset', 'notsubset', 'propersubset', 'reflexsubset', 'element',
+    'notelement', 'angle', 'gradient', 'registerserif', 'copyrightserif',
+    'trademarkserif', 'product', 'radical', 'dotmath', 'logicalnot',
+    'logicaland', 'logicalor', 'arrowdblboth', 'arrowdblleft', 'arrowdblup',
+    'arrowdblright', 'arrowdbldown', 'lozenge', 'angleleft', 'registersans',
+    'copyrightsans', 'trademarksans', 'summation', 'parenlefttp',
+    'parenleftex', 'parenleftbt', 'bracketlefttp', 'bracketleftex',
+    'bracketleftbt', 'bracelefttp', 'braceleftmid', 'braceleftbt', 'braceex',
+    '', 'angleright', 'integral', 'integraltp', 'integralex', 'integralbt',
+    'parenrighttp', 'parenrightex', 'parenrightbt', 'bracketrighttp',
+    'bracketrightex', 'bracketrightbt', 'bracerighttp', 'bracerightmid',
+    'bracerightbt'],
+  zapfDingbatsEncoding: ['', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    'space', 'a1', 'a2', 'a202', 'a3', 'a4', 'a5', 'a119', 'a118', 'a117',
+    'a11', 'a12', 'a13', 'a14', 'a15', 'a16', 'a105', 'a17', 'a18', 'a19',
+    'a20', 'a21', 'a22', 'a23', 'a24', 'a25', 'a26', 'a27', 'a28', 'a6', 'a7',
+    'a8', 'a9', 'a10', 'a29', 'a30', 'a31', 'a32', 'a33', 'a34', 'a35', 'a36',
+    'a37', 'a38', 'a39', 'a40', 'a41', 'a42', 'a43', 'a44', 'a45', 'a46',
+    'a47', 'a48', 'a49', 'a50', 'a51', 'a52', 'a53', 'a54', 'a55', 'a56',
+    'a57', 'a58', 'a59', 'a60', 'a61', 'a62', 'a63', 'a64', 'a65', 'a66',
+    'a67', 'a68', 'a69', 'a70', 'a71', 'a72', 'a73', 'a74', 'a203', 'a75',
+    'a204', 'a76', 'a77', 'a78', 'a79', 'a81', 'a82', 'a83', 'a84', 'a97',
+    'a98', 'a99', 'a100', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '',
+    '', '', 'a101', 'a102', 'a103', 'a104', 'a106', 'a107', 'a108', 'a112',
+    'a111', 'a110', 'a109', 'a120', 'a121', 'a122', 'a123', 'a124', 'a125',
+    'a126', 'a127', 'a128', 'a129', 'a130', 'a131', 'a132', 'a133', 'a134',
+    'a135', 'a136', 'a137', 'a138', 'a139', 'a140', 'a141', 'a142', 'a143',
+    'a144', 'a145', 'a146', 'a147', 'a148', 'a149', 'a150', 'a151', 'a152',
+    'a153', 'a154', 'a155', 'a156', 'a157', 'a158', 'a159', 'a160', 'a161',
+    'a163', 'a164', 'a196', 'a165', 'a192', 'a166', 'a167', 'a168', 'a169',
+    'a170', 'a171', 'a172', 'a173', 'a162', 'a174', 'a175', 'a176', 'a177',
+    'a178', 'a179', 'a193', 'a180', 'a199', 'a181', 'a200', 'a182', '', 'a201',
+    'a183', 'a184', 'a197', 'a185', 'a194', 'a198', 'a186', 'a195', 'a187',
+    'a188', 'a189', 'a190', 'a191']
 };
 
 /**
@@ -13399,6 +13709,19 @@ var serifFonts = {
 var symbolsFonts = {
   'Dingbats': true, 'Symbol': true, 'ZapfDingbats': true
 };
+
+// Some characters, e.g. copyrightserif, mapped to the private use area and
+// might not be displayed using standard fonts. Mapping/hacking well-known chars
+// to the similar equivalents in the normal characters range.
+function mapPrivateUseChars(code) {
+  switch (code) {
+    case 0xF8E9: // copyrightsans
+    case 0xF6D9: // copyrightserif
+      return 0x00A9; // copyright
+    default:
+      return code;
+  }
+}
 
 var FontLoader = {
   listeningForFontLoad: false,
@@ -13542,7 +13865,8 @@ var FontLoader = {
       src += '  window.onload = function fontLoaderOnload() {\n';
       src += '    parent.postMessage(JSON.stringify(fontNames), "*");\n';
       src += '  }';
-      src += '</script></head><body>';
+      // Hack so the end script tag isn't counted if this is inline JS.
+      src += '</scr' + 'ipt></head><body>';
       for (var i = 0, ii = names.length; i < ii; ++i) {
         src += '<p style="font-family:\'' + names[i] + '\'">Hi</p>';
       }
@@ -13731,6 +14055,16 @@ function getUnicodeRangeFor(value) {
   return -1;
 }
 
+function isRTLRangeFor(value) {
+  var range = UnicodeRanges[13];
+  if (value >= range.begin && value < range.end)
+    return true;
+  range = UnicodeRanges[11];
+  if (value >= range.begin && value < range.end)
+    return true;
+  return false;
+}
+
 function isSpecialUnicode(unicode) {
   return (unicode <= 0x1F || (unicode >= 127 && unicode < kSizeOfGlyphArea)) ||
     (unicode >= kCmapGlyphOffset &&
@@ -13756,8 +14090,8 @@ var Font = (function FontClosure() {
     var names = name.split('+');
     names = names.length > 1 ? names[1] : names[0];
     names = names.split(/[-,_]/g)[0];
-    this.isSerifFont = !!(properties.flags & 2);
-    this.isSymbolicFont = !!(properties.flags & 4);
+    this.isSerifFont = !!(properties.flags & FontFlags.Serif);
+    this.isSymbolicFont = !!(properties.flags & FontFlags.Symbolic);
 
     var type = properties.type;
     this.type = type;
@@ -13790,6 +14124,8 @@ var Font = (function FontClosure() {
       this.toUnicode = properties.toUnicode;
     else
       this.rebuildToUnicode(properties);
+
+    this.toFontChar = this.buildToFontChar(this.toUnicode);
 
     if (!file) {
       // The file data is not specified. Trying to fix the font name
@@ -14521,6 +14857,61 @@ var Font = (function FontClosure() {
         }
       };
 
+      function sanitizeGlyph(source, sourceStart, sourceEnd, dest, destStart) {
+        if (sourceEnd - sourceStart <= 12) {
+          // glyph with data less than 12 is invalid one
+          return 0;
+        }
+        var glyf = source.subarray(sourceStart, sourceEnd);
+        var contoursCount = (glyf[0] << 8) | glyf[1];
+        if (contoursCount & 0x8000) {
+          // complex glyph, writing as is
+          dest.set(glyf, destStart);
+          return glyf.length;
+        }
+
+        var j = 10, flagsCount = 0;
+        for (var i = 0; i < contoursCount; i++) {
+          var endPoint = (glyf[j] << 8) | glyf[j + 1];
+          flagsCount = endPoint + 1;
+          j += 2;
+        }
+        // skipping instructions
+        var instructionsLength = (glyf[j] << 8) | glyf[j + 1];
+        j += 2 + instructionsLength;
+        // validating flags
+        var coordinatesLength = 0;
+        for (var i = 0; i < flagsCount; i++) {
+          var flag = glyf[j++];
+          if (flag & 0xC0) {
+            // reserved flags must be zero, rejecting
+            return 0;
+          }
+          var xyLength = ((flag & 2) ? 1 : (flag & 16) ? 0 : 2) +
+                         ((flag & 4) ? 1 : (flag & 32) ? 0 : 2);
+          coordinatesLength += xyLength;
+          if (flag & 8) {
+            var repeat = glyf[j++];
+            i += repeat;
+            coordinatesLength += repeat * xyLength;
+          }
+        }
+        var glyphDataLength = j + coordinatesLength;
+        if (glyphDataLength > glyf.length) {
+          // not enough data for coordinates
+          return 0;
+        }
+        if (glyf.length - glyphDataLength > 3) {
+          // truncating and aligning to 4 bytes the long glyph data
+          glyphDataLength = (glyphDataLength + 3) & ~3;
+          dest.set(glyf.subarray(0, glyphDataLength), destStart);
+          return glyphDataLength;
+        }
+        // glyph data is fine
+        dest.set(glyf, destStart);
+        return glyf.length;
+      }
+
       function sanitizeGlyphLocations(loca, glyf, numGlyphs,
                                       isGlyphLocationsLong) {
         var itemSize, itemDecode, itemEncode;
@@ -14547,21 +14938,41 @@ var Font = (function FontClosure() {
           };
         }
         var locaData = loca.data;
+        // removing the invalid glyphs
+        var oldGlyfData = glyf.data;
+        var oldGlyfDataLength = oldGlyfData.length;
+        var newGlyfData = new Uint8Array(oldGlyfDataLength);
         var startOffset = itemDecode(locaData, 0);
-        var firstOffset = itemDecode(locaData, itemSize);
-        if (firstOffset - startOffset < 12 || startOffset > 0) {
-          // removing first glyph
-          glyf.data = glyf.data.subarray(firstOffset);
-          glyf.length -= firstOffset;
-
-          itemEncode(locaData, 0, 0);
-          var i, pos = itemSize;
-          for (i = 1; i <= numGlyphs; ++i) {
-            itemEncode(locaData, pos,
-              itemDecode(locaData, pos) - firstOffset);
-            pos += itemSize;
+        var writeOffset = 0;
+        itemEncode(locaData, 0, writeOffset);
+        for (var i = 0, j = itemSize; i < numGlyphs; i++, j += itemSize) {
+          var endOffset = itemDecode(locaData, j);
+          if (endOffset > oldGlyfDataLength) {
+            // glyph end offset points outside glyf data, rejecting the glyph
+            itemEncode(locaData, j, writeOffset);
+            startOffset = endOffset;
+            continue;
           }
+
+          var newLength = sanitizeGlyph(oldGlyfData, startOffset, endOffset,
+                                        newGlyfData, writeOffset);
+          writeOffset += newLength;
+          itemEncode(locaData, j, writeOffset);
+          startOffset = endOffset;
         }
+
+        if (writeOffset == 0) {
+          // glyf table cannot be empty -- redoing the glyf and loca tables
+          // to have single glyph with one point
+          var simpleGlyph = new Uint8Array(
+            [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 49, 0]);
+          for (var i = 0, j = itemSize; i < numGlyphs; i++, j += itemSize)
+            itemEncode(locaData, j, simpleGlyph.length);
+          glyf.data = simpleGlyph;
+          return;
+        }
+
+        glyf.data = newGlyfData.subarray(0, writeOffset);
       }
 
       function readGlyphNameMap(post, properties) {
@@ -14745,9 +15156,9 @@ var Font = (function FontClosure() {
         var unassignedUnicodeItems = [];
         for (var i = 1; i < numGlyphs; i++) {
           var cid = gidToCidMap[i] || i;
-          var unicode = this.toUnicode[cid];
-          if (!unicode || isSpecialUnicode(unicode) ||
-              unicode in usedUnicodes) {
+          var unicode = this.toFontChar[cid];
+          if (!unicode || typeof unicode !== 'number' ||
+              isSpecialUnicode(unicode) || unicode in usedUnicodes) {
             unassignedUnicodeItems.push(i);
             continue;
           }
@@ -14766,7 +15177,7 @@ var Font = (function FontClosure() {
           if (unusedUnicode >= kCmapGlyphOffset + kSizeOfGlyphArea)
             break;
           var unicode = unusedUnicode++;
-          this.toUnicode[cid] = unicode;
+          this.toFontChar[cid] = unicode;
           usedUnicodes[unicode] = true;
           glyphs.push({ unicode: unicode, code: cid });
           ids.push(i);
@@ -14777,9 +15188,16 @@ var Font = (function FontClosure() {
         var glyphs = cmapTable.glyphs;
         var ids = cmapTable.ids;
         var hasShortCmap = !!cmapTable.hasShortCmap;
-        var toUnicode = this.toUnicode;
+        var toFontChar = this.toFontChar;
 
-        if (toUnicode && toUnicode.length > 0) {
+        if (hasShortCmap && ids.length == numGlyphs) {
+          // Fixes the short cmap tables -- some generators use incorrect
+          // glyph id.
+          for (var i = 0, ii = ids.length; i < ii; i++)
+            ids[i] = i;
+        }
+
+        if (toFontChar && toFontChar.length > 0) {
           // checking if cmap is just identity map
           var isIdentity = true;
           for (var i = 0, ii = glyphs.length; i < ii; i++) {
@@ -14789,11 +15207,12 @@ var Font = (function FontClosure() {
             }
           }
           // if it is, replacing with meaningful toUnicode values
-          if (isIdentity) {
+          if (isIdentity && !this.isSymbolicFont) {
             var usedUnicodes = [], unassignedUnicodeItems = [];
             for (var i = 0, ii = glyphs.length; i < ii; i++) {
-              var unicode = toUnicode[i + 1];
-              if (!unicode || unicode in usedUnicodes) {
+              var unicode = toFontChar[i + 1];
+              if (!unicode || typeof unicode !== 'number' ||
+                  unicode in usedUnicodes) {
                 unassignedUnicodeItems.push(i);
                 continue;
               }
@@ -14807,11 +15226,11 @@ var Font = (function FontClosure() {
                 unusedUnicode++;
               var cid = i + 1;
               // override only if unicode mapping is not specified
-              if (!(cid in toUnicode))
-                toUnicode[cid] = unusedUnicode;
+              if (!(cid in toFontChar))
+                toFontChar[cid] = unusedUnicode;
               glyphs[i].unicode = unusedUnicode++;
             }
-            this.useToUnicode = true;
+            this.useToFontChar = true;
           }
         }
 
@@ -14821,11 +15240,14 @@ var Font = (function FontClosure() {
           // copying all characters to private use area, all mapping all known
           // glyphs to the unicodes. The glyphs and ids arrays will grow.
           var usedUnicodes = [];
+          var glyphNames = properties.glyphNames || [];
           for (var i = 0, ii = glyphs.length; i < ii; i++) {
             var code = glyphs[i].unicode;
+            var gid = ids[i];
             glyphs[i].unicode += kCmapGlyphOffset;
+            toFontChar[code] = glyphs[i].unicode;
 
-            var glyphName = properties.baseEncoding[code];
+            var glyphName = glyphNames[gid] || properties.baseEncoding[code];
             if (glyphName in GlyphsUnicode) {
               var unicode = GlyphsUnicode[glyphName];
               if (unicode in usedUnicodes)
@@ -14836,9 +15258,21 @@ var Font = (function FontClosure() {
                 unicode: unicode,
                 code: glyphs[i].code
               });
-              ids.push(ids[i]);
+              ids.push(gid);
+              toFontChar[code] = unicode;
             }
           }
+          this.useToFontChar = true;
+        }
+
+        // Moving all symbolic font glyphs into 0xF000 - 0xF0FF range.
+        if (this.isSymbolicFont) {
+          for (var i = 0, ii = glyphs.length; i < ii; i++) {
+            var code = glyphs[i].unicode & 0xFF;
+            var fontCharCode = kSymbolicFontGlyphOffset | code;
+            glyphs[i].unicode = toFontChar[code] = fontCharCode;
+          }
+          this.useToFontChar = true;
         }
 
         // remove glyph references outside range of avaialable glyphs
@@ -14941,12 +15375,12 @@ var Font = (function FontClosure() {
         properties.baseEncoding = encoding;
       }
       if (properties.subtype == 'CIDFontType0C') {
-        var toUnicode = [];
+        var toFontChar = [];
         for (var i = 0; i < charstrings.length; ++i) {
           var charstring = charstrings[i];
-          toUnicode[charstring.code] = charstring.unicode;
+          toFontChar[charstring.code] = charstring.unicode;
         }
-        this.toUnicode = toUnicode;
+        this.toFontChar = toFontChar;
       }
 
       var fields = {
@@ -15039,6 +15473,19 @@ var Font = (function FontClosure() {
       }
 
       return stringToArray(otf.file);
+    },
+
+    buildToFontChar: function font_buildToFontChar(toUnicode) {
+      var result = [];
+      var unusedUnicode = kCmapGlyphOffset;
+      for (var i = 0, ii = toUnicode.length; i < ii; i++) {
+        var unicode = toUnicode[i];
+        var fontCharCode = typeof unicode === 'object' ? unusedUnicode++ :
+          unicode;
+        if (typeof unicode !== 'undefined')
+          result[i] = fontCharCode;
+      }
+      return result;
     },
 
     rebuildToUnicode: function font_rebuildToUnicode(properties) {
@@ -15138,6 +15585,9 @@ var Font = (function FontClosure() {
       var styleSheet = styleElement.sheet;
       styleSheet.insertRule(rule, styleSheet.cssRules.length);
 
+      if (PDFJS.pdfBug && FontInspector.enabled)
+        FontInspector.fontAdded(this, url);
+
       return rule;
     },
 
@@ -15173,7 +15623,7 @@ var Font = (function FontClosure() {
     },
 
     charToGlyph: function fonts_charToGlyph(charcode) {
-      var unicode, width, codeIRQueue;
+      var fontCharCode, width, codeIRQueue;
 
       var width = this.widths[charcode];
 
@@ -15181,38 +15631,39 @@ var Font = (function FontClosure() {
         case 'CIDFontType0':
           if (this.noUnicodeAdaptation) {
             width = this.widths[this.unicodeToCID[charcode] || charcode];
-            unicode = charcode;
+            fontCharCode = mapPrivateUseChars(charcode);
             break;
           }
-          unicode = this.toUnicode[charcode] || charcode;
+          fontCharCode = this.toFontChar[charcode] || charcode;
           break;
         case 'CIDFontType2':
           if (this.noUnicodeAdaptation) {
             width = this.widths[this.unicodeToCID[charcode] || charcode];
-            unicode = charcode;
+            fontCharCode = mapPrivateUseChars(charcode);
             break;
           }
-          unicode = this.toUnicode[charcode] || charcode;
+          fontCharCode = this.toFontChar[charcode] || charcode;
           break;
         case 'Type1':
           var glyphName = this.differences[charcode] || this.encoding[charcode];
           if (!isNum(width))
             width = this.widths[glyphName];
           if (this.noUnicodeAdaptation) {
-            unicode = GlyphsUnicode[glyphName] || charcode;
+            fontCharCode = mapPrivateUseChars(GlyphsUnicode[glyphName] ||
+              charcode);
             break;
           }
-          unicode = this.glyphNameMap[glyphName] ||
+          fontCharCode = this.glyphNameMap[glyphName] ||
             GlyphsUnicode[glyphName] || charcode;
           break;
         case 'Type3':
           var glyphName = this.differences[charcode] || this.encoding[charcode];
           codeIRQueue = this.charProcIRQueues[glyphName];
-          unicode = charcode;
+          fontCharCode = charcode;
           break;
         case 'TrueType':
-          if (this.useToUnicode) {
-            unicode = this.toUnicode[charcode] || charcode;
+          if (this.useToFontChar) {
+            fontCharCode = this.toFontChar[charcode] || charcode;
             break;
           }
           var glyphName = this.differences[charcode] || this.encoding[charcode];
@@ -15221,16 +15672,17 @@ var Font = (function FontClosure() {
           if (!isNum(width))
             width = this.widths[glyphName];
           if (this.noUnicodeAdaptation) {
-            unicode = GlyphsUnicode[glyphName] || charcode;
+            fontCharCode = GlyphsUnicode[glyphName] || charcode;
             break;
           }
           if (!this.hasEncoding || this.isSymbolicFont) {
-            unicode = this.useToUnicode ? this.toUnicode[charcode] : charcode;
+            fontCharCode = this.useToFontChar ? this.toFontChar[charcode] :
+              charcode;
             break;
           }
 
           // MacRoman encoding address by re-encoding the cmap table
-          unicode = glyphName in this.glyphNameMap ?
+          fontCharCode = glyphName in this.glyphNameMap ?
             this.glyphNameMap[glyphName] : GlyphsUnicode[glyphName];
           break;
         default:
@@ -15246,7 +15698,7 @@ var Font = (function FontClosure() {
       width = (isNum(width) ? width : this.defaultWidth) * this.widthMultiplier;
 
       return {
-        fontChar: String.fromCharCode(unicode),
+        fontChar: String.fromCharCode(fontCharCode),
         unicode: unicodeChars,
         width: width,
         codeIRQueue: codeIRQueue
@@ -15588,7 +16040,13 @@ var Type1Parser = function type1Parser() {
     while (str[index++] != ']')
       count++;
 
-    var array = str.substr(start, count).split(' ');
+    str = str.substr(start, count);
+
+    str = str.trim();
+    // Remove adjacent spaces
+    str = str.replace(/\s+/g, ' ');
+
+    var array = str.split(' ');
     for (var i = 0, ii = array.length; i < ii; i++)
       array[i] = parseFloat(array[i] || 0);
     return array;
@@ -16225,7 +16683,9 @@ var Type2CFF = (function Type2CFFClosure() {
     parse: function cff_parse() {
       var header = this.parseHeader();
       var properties = this.properties;
+
       var nameIndex = this.parseIndex(header.endPos);
+      this.sanitizeName(nameIndex);
 
       var dictIndex = this.parseIndex(nameIndex.endPos);
       if (dictIndex.length != 1)
@@ -16589,10 +17049,43 @@ var Type2CFF = (function Type2CFFClosure() {
             dict['cidOperatorPresent'] = true;
             break;
           default:
-            TODO('interpret top dict key');
+            TODO('interpret top dict key: ' + key);
         }
       }
       return dict;
+    },
+    sanitizeName: function cff_sanitizeName(nameIndex) {
+      // There should really only be one font, but loop to make sure.
+      for (var i = 0, ii = nameIndex.length; i < ii; ++i) {
+        var data = nameIndex.get(i).data;
+        var length = data.length;
+        if (length > 127)
+          warn('Font had name longer than 127 chars, will be rejected.');
+        // Only certain chars are permitted in the font name.
+        for (var j = 0; j < length; ++j) {
+          var c = data[j];
+          if (j === 0 && c === 0)
+            continue;
+          if (c < 33 || c > 126) {
+            data[j] = 95;
+            continue;
+          }
+          switch (c) {
+            case 91:  // [
+            case 93:  // ]
+            case 40:  // (
+            case 41:  // )
+            case 123: // {
+            case 125: // }
+            case 60:  // <
+            case 62:  // >
+            case 47:  // /
+            case 37:  // %
+              data[j] = 95;
+              break;
+          }
+        }
+      }
     },
     getStrings: function cff_getStrings(stringIndex) {
       function bytesToString(bytesArray) {
@@ -24497,17 +24990,17 @@ var Parser = (function ParserClosure() {
       // parse image stream
       var startPos = stream.pos;
 
-      // searching for the /\sEI\s/
+      // searching for the /EI\s/
       var state = 0, ch;
       while (state != 4 && (ch = stream.getByte()) != null) {
         switch (ch) {
           case 0x20:
           case 0x0D:
           case 0x0A:
-            state = state === 3 ? 4 : 1;
+            state = state === 3 ? 4 : 0;
             break;
           case 0x45:
-            state = state === 1 ? 2 : 0;
+            state = 2;
             break;
           case 0x49:
             state = state === 2 ? 3 : 0;
@@ -24539,6 +25032,10 @@ var Parser = (function ParserClosure() {
 
       return imageStream;
     },
+    fetchIfRef: function parserFetchIfRef(obj) {
+      // not relying on the xref.fetchIfRef -- xref might not be set
+      return isRef(obj) ? this.xref.fetch(obj) : obj;
+    },
     makeStream: function parserMakeStream(dict, cipherTransform) {
       var lexer = this.lexer;
       var stream = lexer.stream;
@@ -24548,10 +25045,7 @@ var Parser = (function ParserClosure() {
       var pos = stream.pos;
 
       // get length
-      var length = dict.get('Length');
-      var xref = this.xref;
-      if (xref)
-        length = xref.fetchIfRef(length);
+      var length = this.fetchIfRef(dict.get('Length'));
       if (!isInt(length)) {
         error('Bad ' + length + ' attribute in stream');
         length = 0;
@@ -24573,8 +25067,8 @@ var Parser = (function ParserClosure() {
       return stream;
     },
     filter: function parserFilter(stream, dict, length) {
-      var filter = dict.get('Filter', 'F');
-      var params = dict.get('DecodeParms', 'DP');
+      var filter = this.fetchIfRef(dict.get('Filter', 'F'));
+      var params = this.fetchIfRef(dict.get('DecodeParms', 'DP'));
       if (isName(filter))
         return this.makeFilter(stream, filter.name, length, params);
       if (isArray(filter)) {
@@ -25947,7 +26441,6 @@ var PredictorStream = (function PredictorStreamClosure() {
 
     var bufferLength = this.bufferLength;
     var buffer = this.ensureBuffer(bufferLength + rowBytes);
-    var currentRow = buffer.subarray(bufferLength, bufferLength + rowBytes);
 
     var bits = this.bits;
     var colors = this.colors;
@@ -25956,6 +26449,7 @@ var PredictorStream = (function PredictorStreamClosure() {
 
     var inbuf = 0, outbuf = 0;
     var inbits = 0, outbits = 0;
+    var pos = bufferLength;
 
     if (bits === 1) {
       for (var i = 0; i < rowBytes; ++i) {
@@ -25963,19 +26457,21 @@ var PredictorStream = (function PredictorStreamClosure() {
         inbuf = (inbuf << 8) | c;
         // bitwise addition is exclusive or
         // first shift inbuf and then add
-        currentRow[i] = (c ^ (inbuf >> colors)) & 0xFF;
+        buffer[pos++] = (c ^ (inbuf >> colors)) & 0xFF;
         // truncate inbuf (assumes colors < 16)
         inbuf &= 0xFFFF;
       }
     } else if (bits === 8) {
       for (var i = 0; i < colors; ++i)
-        currentRow[i] = rawBytes[i];
-      for (; i < rowBytes; ++i)
-        currentRow[i] = currentRow[i - colors] + rawBytes[i];
+        buffer[pos++] = rawBytes[i];
+      for (; i < rowBytes; ++i) {
+        buffer[pos] = buffer[pos - colors] + rawBytes[i];
+        pos++;
+      }
     } else {
       var compArray = new Uint8Array(colors + 1);
       var bitMask = (1 << bits) - 1;
-      var j = 0, k = 0;
+      var j = 0, k = bufferLength;
       var columns = this.columns;
       for (var i = 0; i < columns; ++i) {
         for (var kk = 0; kk < colors; ++kk) {
@@ -25989,13 +26485,13 @@ var PredictorStream = (function PredictorStreamClosure() {
           outbuf = (outbuf << bits) | compArray[kk];
           outbits += bits;
           if (outbits >= 8) {
-            currentRow[k++] = (outbuf >> (outbits - 8)) & 0xFF;
+            buffer[k++] = (outbuf >> (outbits - 8)) & 0xFF;
             outbits -= 8;
           }
         }
       }
       if (outbits > 0) {
-        currentRow[k++] = (outbuf << (8 - outbits)) +
+        buffer[k++] = (outbuf << (8 - outbits)) +
         (inbuf & ((1 << (8 - outbits)) - 1));
       }
     }
@@ -26014,32 +26510,35 @@ var PredictorStream = (function PredictorStreamClosure() {
     var bufferLength = this.bufferLength;
     var buffer = this.ensureBuffer(bufferLength + rowBytes);
 
-    var currentRow = buffer.subarray(bufferLength, bufferLength + rowBytes);
     var prevRow = buffer.subarray(bufferLength - rowBytes, bufferLength);
     if (prevRow.length == 0)
       prevRow = new Uint8Array(rowBytes);
 
+    var j = bufferLength;
     switch (predictor) {
       case 0:
         for (var i = 0; i < rowBytes; ++i)
-          currentRow[i] = rawBytes[i];
+          buffer[j++] = rawBytes[i];
         break;
       case 1:
         for (var i = 0; i < pixBytes; ++i)
-          currentRow[i] = rawBytes[i];
-        for (; i < rowBytes; ++i)
-          currentRow[i] = (currentRow[i - pixBytes] + rawBytes[i]) & 0xFF;
+          buffer[j++] = rawBytes[i];
+        for (; i < rowBytes; ++i) {
+          buffer[j] = (buffer[j - pixBytes] + rawBytes[i]) & 0xFF;
+          j++;
+        }
         break;
       case 2:
         for (var i = 0; i < rowBytes; ++i)
-          currentRow[i] = (prevRow[i] + rawBytes[i]) & 0xFF;
+          buffer[j++] = (prevRow[i] + rawBytes[i]) & 0xFF;
         break;
       case 3:
         for (var i = 0; i < pixBytes; ++i)
-          currentRow[i] = (prevRow[i] >> 1) + rawBytes[i];
+          buffer[j++] = (prevRow[i] >> 1) + rawBytes[i];
         for (; i < rowBytes; ++i) {
-          currentRow[i] = (((prevRow[i] + currentRow[i - pixBytes]) >> 1) +
+          buffer[j] = (((prevRow[i] + buffer[j - pixBytes]) >> 1) +
                            rawBytes[i]) & 0xFF;
+          j++;
         }
         break;
       case 4:
@@ -26048,12 +26547,12 @@ var PredictorStream = (function PredictorStreamClosure() {
         for (var i = 0; i < pixBytes; ++i) {
           var up = prevRow[i];
           var c = rawBytes[i];
-          currentRow[i] = up + c;
+          buffer[j++] = up + c;
         }
         for (; i < rowBytes; ++i) {
           var up = prevRow[i];
           var upLeft = prevRow[i - pixBytes];
-          var left = currentRow[i - pixBytes];
+          var left = buffer[j - pixBytes];
           var p = left + up - upLeft;
 
           var pa = p - left;
@@ -26068,11 +26567,11 @@ var PredictorStream = (function PredictorStreamClosure() {
 
           var c = rawBytes[i];
           if (pa <= pb && pa <= pc)
-            currentRow[i] = left + c;
+            buffer[j++] = left + c;
           else if (pb <= pc)
-            currentRow[i] = up + c;
+            buffer[j++] = up + c;
           else
-            currentRow[i] = upLeft + c;
+            buffer[j++] = upLeft + c;
         }
         break;
       default:
@@ -26145,15 +26644,19 @@ var JpegStream = (function JpegStreamClosure() {
   JpegStream.prototype.ensureBuffer = function jpegStreamEnsureBuffer(req) {
     if (this.bufferLength)
       return;
-    var jpegImage = new JpegImage();
-    if (this.colorTransform != -1)
-      jpegImage.colorTransform = this.colorTransform;
-    jpegImage.parse(this.bytes);
-    var width = jpegImage.width;
-    var height = jpegImage.height;
-    var data = jpegImage.getData(width, height);
-    this.buffer = data;
-    this.bufferLength = data.length;
+    try {
+      var jpegImage = new JpegImage();
+      if (this.colorTransform != -1)
+        jpegImage.colorTransform = this.colorTransform;
+      jpegImage.parse(this.bytes);
+      var width = jpegImage.width;
+      var height = jpegImage.height;
+      var data = jpegImage.getData(width, height);
+      this.buffer = data;
+      this.bufferLength = data.length;
+    } catch (e) {
+      error('JPEG error: ' + e);
+    }
   };
   JpegStream.prototype.getIR = function jpegStreamGetIR() {
     return bytesToString(this.bytes);
@@ -27635,7 +28138,7 @@ function MessageHandler(name, comObj) {
         delete callbacks[callbackId];
         callback(data.data);
       } else {
-        throw 'Cannot resolve callback ' + callbackId;
+        error('Cannot resolve callback ' + callbackId);
       }
     } else if (data.action in ah) {
       var action = ah[data.action];
@@ -27653,7 +28156,7 @@ function MessageHandler(name, comObj) {
         action[0].call(action[1], data.data);
       }
     } else {
-      throw 'Unkown action from worker: ' + data.action;
+      error('Unkown action from worker: ' + data.action);
     }
   };
 }
@@ -27662,7 +28165,7 @@ MessageHandler.prototype = {
   on: function messageHandlerOn(actionName, handler, scope) {
     var ah = this.actionHandler;
     if (ah[actionName]) {
-      throw 'There is already an actionName called "' + actionName + '"';
+      error('There is already an actionName called "' + actionName + '"');
     }
     ah[actionName] = [handler, scope];
   },
@@ -27718,11 +28221,27 @@ var WorkerMessageHandler = {
         // Pre compile the pdf page and fetch the fonts/images.
         IRQueue = page.getIRQueue(handler, dependency);
       } catch (e) {
+        var minimumStackMessage =
+            'worker.js: while trying to getPage() and getIRQueue()';
+
         // Turn the error into an obj that can be serialized
-        e = {
-          message: typeof e === 'object' ? e.message : e,
-          stack: typeof e === 'object' ? e.stack : null
-        };
+        if (typeof e === 'string') {
+          e = {
+            message: e,
+            stack: minimumStackMessage
+          };
+        } else if (typeof e === 'object') {
+          e = {
+            message: e.message || e.toString(),
+            stack: e.stack || minimumStackMessage
+          };
+        } else {
+          e = {
+            message: 'Unknown exception type: ' + (typeof e),
+            stack: minimumStackMessage
+          };
+        }
+
         handler.send('page_error', {
           pageNum: pageNum,
           error: e
@@ -27817,6 +28336,7 @@ var workerConsole = {
       action: 'console_error',
       data: args
     });
+    throw 'pdf.js execution error';
   },
 
   time: function time(name) {
@@ -27826,7 +28346,7 @@ var workerConsole = {
   timeEnd: function timeEnd(name) {
     var time = consoleTimer[name];
     if (time == null) {
-      throw 'Unkown timer name ' + name;
+      error('Unkown timer name ' + name);
     }
     this.log('Timer:', name, Date.now() - time);
   }
@@ -29939,7 +30459,7 @@ var JpxImage = (function JpxImageClosure() {
           new ResolutionLayerComponentPositionIterator(context);
         break;
       default:
-        throw 'Unsupported progression order';
+        throw 'Unsupported progression order ' + progressionOrder;
     }
   }
   function parseTilePackets(context, data, offset, dataLength) {
@@ -30305,6 +30825,7 @@ var JpxImage = (function JpxImageClosure() {
   }
 
   function JpxImage() {
+    this.failOnCorruptedImage = false;
   }
   JpxImage.prototype = {
     load: function jpxImageLoad(url) {
@@ -30341,7 +30862,7 @@ var JpxImage = (function JpxImageClosure() {
         if (lbox == 0)
           lbox = length - position + headerSize;
         if (lbox < headerSize)
-          throw 'Invalid box field size';
+          error('JPX error: Invalid box field size');
         var dataLength = lbox - headerSize;
         var jumpDataLength = true;
         switch (tbox) {
@@ -30364,237 +30885,244 @@ var JpxImage = (function JpxImageClosure() {
     },
     parseCodestream: function jpxImageParseCodestream(data, start, end) {
       var context = {};
-      var position = start;
-      while (position < end) {
-        var code = readUint16(data, position);
-        position += 2;
+      try {
+        var position = start;
+        while (position < end) {
+          var code = readUint16(data, position);
+          position += 2;
 
-        var length = 0, j;
-        switch (code) {
-          case 0xFF4F: // Start of codestream (SOC)
-            context.mainHeader = true;
-            break;
-          case 0xFFD9: // End of codestream (EOC)
-            break;
-          case 0xFF51: // Image and tile size (SIZ)
-            length = readUint16(data, position);
-            var siz = {};
-            siz.Xsiz = readUint32(data, position + 4);
-            siz.Ysiz = readUint32(data, position + 8);
-            siz.XOsiz = readUint32(data, position + 12);
-            siz.YOsiz = readUint32(data, position + 16);
-            siz.XTsiz = readUint32(data, position + 20);
-            siz.YTsiz = readUint32(data, position + 24);
-            siz.XTOsiz = readUint32(data, position + 28);
-            siz.YTOsiz = readUint32(data, position + 32);
-            var componentsCount = readUint16(data, position + 36);
-            siz.Csiz = componentsCount;
-            var components = [];
-            j = position + 38;
-            for (var i = 0; i < componentsCount; i++) {
-              var component = {
-                precision: (data[j] & 0x7F) + 1,
-                isSigned: !!(data[j] & 0x80),
-                XRsiz: data[j + 1],
-                YRsiz: data[j + 1]
-              };
-              calculateComponentDimensions(component, siz);
-              components.push(component);
-            }
-            context.SIZ = siz;
-            context.components = components;
-            calculateTileGrids(context, components);
-            context.QCC = [];
-            context.COC = [];
-            break;
-          case 0xFF5C: // Quantization default (QCD)
-            length = readUint16(data, position);
-            var qcd = {};
-            j = position + 2;
-            var sqcd = data[j++];
-            var spqcdSize, scalarExpounded;
-            switch (sqcd & 0x1F) {
-              case 0:
-                spqcdSize = 8;
-                scalarExpounded = true;
-                break;
-              case 1:
-                spqcdSize = 16;
-                scalarExpounded = false;
-                break;
-              case 2:
-                spqcdSize = 16;
-                scalarExpounded = true;
-                break;
-              default:
-                throw 'Invalid SQcd value';
-            }
-            qcd.noQuantization = spqcdSize == 8;
-            qcd.scalarExpounded = scalarExpounded;
-            qcd.guardBits = sqcd >> 5;
-            var spqcds = [];
-            while (j < length + position) {
-              var spqcd = {};
-              if (spqcdSize == 8) {
-                spqcd.epsilon = data[j++] >> 3;
-                spqcd.mu = 0;
-              } else {
-                spqcd.epsilon = data[j] >> 3;
-                spqcd.mu = ((data[j] & 0x7) << 8) | data[j + 1];
-                j += 2;
+          var length = 0, j;
+          switch (code) {
+            case 0xFF4F: // Start of codestream (SOC)
+              context.mainHeader = true;
+              break;
+            case 0xFFD9: // End of codestream (EOC)
+              break;
+            case 0xFF51: // Image and tile size (SIZ)
+              length = readUint16(data, position);
+              var siz = {};
+              siz.Xsiz = readUint32(data, position + 4);
+              siz.Ysiz = readUint32(data, position + 8);
+              siz.XOsiz = readUint32(data, position + 12);
+              siz.YOsiz = readUint32(data, position + 16);
+              siz.XTsiz = readUint32(data, position + 20);
+              siz.YTsiz = readUint32(data, position + 24);
+              siz.XTOsiz = readUint32(data, position + 28);
+              siz.YTOsiz = readUint32(data, position + 32);
+              var componentsCount = readUint16(data, position + 36);
+              siz.Csiz = componentsCount;
+              var components = [];
+              j = position + 38;
+              for (var i = 0; i < componentsCount; i++) {
+                var component = {
+                  precision: (data[j] & 0x7F) + 1,
+                  isSigned: !!(data[j] & 0x80),
+                  XRsiz: data[j + 1],
+                  YRsiz: data[j + 1]
+                };
+                calculateComponentDimensions(component, siz);
+                components.push(component);
               }
-              spqcds.push(spqcd);
-            }
-            qcd.SPqcds = spqcds;
-            if (context.mainHeader)
-              context.QCD = qcd;
-            else {
-              context.currentTile.QCD = qcd;
-              context.currentTile.QCC = [];
-            }
-            break;
-          case 0xFF5D: // Quantization component (QCC)
-            length = readUint16(data, position);
-            var qcc = {};
-            j = position + 2;
-            var cqcc;
-            if (context.SIZ.Csiz < 257)
-              cqcc = data[j++];
-            else {
-              cqcc = readUint16(data, j);
-              j += 2;
-            }
-            var sqcd = data[j++];
-            var spqcdSize, scalarExpounded;
-            switch (sqcd & 0x1F) {
-              case 0:
-                spqcdSize = 8;
-                scalarExpounded = true;
-                break;
-              case 1:
-                spqcdSize = 16;
-                scalarExpounded = false;
-                break;
-              case 2:
-                spqcdSize = 16;
-                scalarExpounded = true;
-                break;
-              default:
-                throw 'Invalid SQcd value';
-            }
-            qcc.noQuantization = spqcdSize == 8;
-            qcc.scalarExpounded = scalarExpounded;
-            qcc.guardBits = sqcd >> 5;
-            var spqcds = [];
-            while (j < length + position) {
-              var spqcd = {};
-              if (spqcdSize == 8) {
-                spqcd.epsilon = data[j++] >> 3;
-                spqcd.mu = 0;
-              } else {
-                spqcd.epsilon = data[j] >> 3;
-                spqcd.mu = ((data[j] & 0x7) << 8) | data[j + 1];
-                j += 2;
+              context.SIZ = siz;
+              context.components = components;
+              calculateTileGrids(context, components);
+              context.QCC = [];
+              context.COC = [];
+              break;
+            case 0xFF5C: // Quantization default (QCD)
+              length = readUint16(data, position);
+              var qcd = {};
+              j = position + 2;
+              var sqcd = data[j++];
+              var spqcdSize, scalarExpounded;
+              switch (sqcd & 0x1F) {
+                case 0:
+                  spqcdSize = 8;
+                  scalarExpounded = true;
+                  break;
+                case 1:
+                  spqcdSize = 16;
+                  scalarExpounded = false;
+                  break;
+                case 2:
+                  spqcdSize = 16;
+                  scalarExpounded = true;
+                  break;
+                default:
+                  throw 'Invalid SQcd value ' + sqcd;
               }
-              spqcds.push(spqcd);
-            }
-            qcc.SPqcds = spqcds;
-            if (context.mainHeader)
-              context.QCC[cqcc] = qcc;
-            else
-              context.currentTile.QCC[cqcc] = qcc;
-            break;
-          case 0xFF52: // Coding style default (COD)
-            length = readUint16(data, position);
-            var cod = {};
-            j = position + 2;
-            var scod = data[j++];
-            cod.entropyCoderWithCustomPrecincts = !!(scod & 1);
-            cod.sopMarkerUsed = !!(scod & 2);
-            cod.ephMarkerUsed = !!(scod & 4);
-            var codingStyle = {};
-            cod.progressionOrder = data[j++];
-            cod.layersCount = readUint16(data, j);
-            j += 2;
-            cod.multipleComponentTransform = data[j++];
-
-            cod.decompositionLevelsCount = data[j++];
-            cod.xcb = (data[j++] & 0xF) + 2;
-            cod.ycb = (data[j++] & 0xF) + 2;
-            var blockStyle = data[j++];
-            cod.selectiveArithmeticCodingBypass = !!(blockStyle & 1);
-            cod.resetContextProbabilities = !!(blockStyle & 2);
-            cod.terminationOnEachCodingPass = !!(blockStyle & 4);
-            cod.verticalyStripe = !!(blockStyle & 8);
-            cod.predictableTermination = !!(blockStyle & 16);
-            cod.segmentationSymbolUsed = !!(blockStyle & 32);
-            cod.transformation = data[j++];
-            if (cod.entropyCoderWithCustomPrecincts) {
-              var precinctsSizes = {};
+              qcd.noQuantization = spqcdSize == 8;
+              qcd.scalarExpounded = scalarExpounded;
+              qcd.guardBits = sqcd >> 5;
+              var spqcds = [];
               while (j < length + position) {
-                var precinctsSize = data[j];
-                precinctsSizes.push({
-                  PPx: precinctsSize & 0xF,
-                  PPy: precinctsSize >> 4
-                });
+                var spqcd = {};
+                if (spqcdSize == 8) {
+                  spqcd.epsilon = data[j++] >> 3;
+                  spqcd.mu = 0;
+                } else {
+                  spqcd.epsilon = data[j] >> 3;
+                  spqcd.mu = ((data[j] & 0x7) << 8) | data[j + 1];
+                  j += 2;
+                }
+                spqcds.push(spqcd);
               }
-              cod.precinctsSizes = precinctsSizes;
-            }
+              qcd.SPqcds = spqcds;
+              if (context.mainHeader)
+                context.QCD = qcd;
+              else {
+                context.currentTile.QCD = qcd;
+                context.currentTile.QCC = [];
+              }
+              break;
+            case 0xFF5D: // Quantization component (QCC)
+              length = readUint16(data, position);
+              var qcc = {};
+              j = position + 2;
+              var cqcc;
+              if (context.SIZ.Csiz < 257)
+                cqcc = data[j++];
+              else {
+                cqcc = readUint16(data, j);
+                j += 2;
+              }
+              var sqcd = data[j++];
+              var spqcdSize, scalarExpounded;
+              switch (sqcd & 0x1F) {
+                case 0:
+                  spqcdSize = 8;
+                  scalarExpounded = true;
+                  break;
+                case 1:
+                  spqcdSize = 16;
+                  scalarExpounded = false;
+                  break;
+                case 2:
+                  spqcdSize = 16;
+                  scalarExpounded = true;
+                  break;
+                default:
+                  throw 'Invalid SQcd value ' + sqcd;
+              }
+              qcc.noQuantization = spqcdSize == 8;
+              qcc.scalarExpounded = scalarExpounded;
+              qcc.guardBits = sqcd >> 5;
+              var spqcds = [];
+              while (j < length + position) {
+                var spqcd = {};
+                if (spqcdSize == 8) {
+                  spqcd.epsilon = data[j++] >> 3;
+                  spqcd.mu = 0;
+                } else {
+                  spqcd.epsilon = data[j] >> 3;
+                  spqcd.mu = ((data[j] & 0x7) << 8) | data[j + 1];
+                  j += 2;
+                }
+                spqcds.push(spqcd);
+              }
+              qcc.SPqcds = spqcds;
+              if (context.mainHeader)
+                context.QCC[cqcc] = qcc;
+              else
+                context.currentTile.QCC[cqcc] = qcc;
+              break;
+            case 0xFF52: // Coding style default (COD)
+              length = readUint16(data, position);
+              var cod = {};
+              j = position + 2;
+              var scod = data[j++];
+              cod.entropyCoderWithCustomPrecincts = !!(scod & 1);
+              cod.sopMarkerUsed = !!(scod & 2);
+              cod.ephMarkerUsed = !!(scod & 4);
+              var codingStyle = {};
+              cod.progressionOrder = data[j++];
+              cod.layersCount = readUint16(data, j);
+              j += 2;
+              cod.multipleComponentTransform = data[j++];
 
-            if (cod.sopMarkerUsed || cod.ephMarkerUsed ||
-                cod.selectiveArithmeticCodingBypass ||
-                cod.resetContextProbabilities ||
-                cod.terminationOnEachCodingPass ||
-                cod.verticalyStripe || cod.predictableTermination ||
-                cod.segmentationSymbolUsed)
-              throw 'Unsupported COD options: ' + uneval(cod);
+              cod.decompositionLevelsCount = data[j++];
+              cod.xcb = (data[j++] & 0xF) + 2;
+              cod.ycb = (data[j++] & 0xF) + 2;
+              var blockStyle = data[j++];
+              cod.selectiveArithmeticCodingBypass = !!(blockStyle & 1);
+              cod.resetContextProbabilities = !!(blockStyle & 2);
+              cod.terminationOnEachCodingPass = !!(blockStyle & 4);
+              cod.verticalyStripe = !!(blockStyle & 8);
+              cod.predictableTermination = !!(blockStyle & 16);
+              cod.segmentationSymbolUsed = !!(blockStyle & 32);
+              cod.transformation = data[j++];
+              if (cod.entropyCoderWithCustomPrecincts) {
+                var precinctsSizes = {};
+                while (j < length + position) {
+                  var precinctsSize = data[j];
+                  precinctsSizes.push({
+                    PPx: precinctsSize & 0xF,
+                    PPy: precinctsSize >> 4
+                  });
+                }
+                cod.precinctsSizes = precinctsSizes;
+              }
 
-            if (context.mainHeader)
-              context.COD = cod;
-            else {
-              context.currentTile.COD = cod;
-              context.currentTile.COC = [];
-            }
-            break;
-          case 0xFF90: // Start of tile-part (SOT)
-            length = readUint16(data, position);
-            var tile = {};
-            tile.index = readUint16(data, position + 2);
-            tile.length = readUint32(data, position + 4);
-            tile.dataEnd = tile.length + position - 2;
-            tile.partIndex = data[position + 8];
-            tile.partsCount = data[position + 9];
+              if (cod.sopMarkerUsed || cod.ephMarkerUsed ||
+                  cod.selectiveArithmeticCodingBypass ||
+                  cod.resetContextProbabilities ||
+                  cod.terminationOnEachCodingPass ||
+                  cod.verticalyStripe || cod.predictableTermination ||
+                  cod.segmentationSymbolUsed)
+                throw 'Unsupported COD options: ' + uneval(cod);
 
-            context.mainHeader = false;
-            if (tile.partIndex == 0) {
-              // reset component specific settings
-              tile.COD = context.COD;
-              tile.COC = context.COC.slice(0); // clone of the global COC
-              tile.QCD = context.QCD;
-              tile.QCC = context.QCC.slice(0); // clone of the global COC
-            }
-            context.currentTile = tile;
-            break;
-          case 0xFF93: // Start of data (SOD)
-            var tile = context.currentTile;
-            if (tile.partIndex == 0) {
-              initializeTile(context, tile.index);
-              buildPackets(context);
-            }
+              if (context.mainHeader)
+                context.COD = cod;
+              else {
+                context.currentTile.COD = cod;
+                context.currentTile.COC = [];
+              }
+              break;
+            case 0xFF90: // Start of tile-part (SOT)
+              length = readUint16(data, position);
+              var tile = {};
+              tile.index = readUint16(data, position + 2);
+              tile.length = readUint32(data, position + 4);
+              tile.dataEnd = tile.length + position - 2;
+              tile.partIndex = data[position + 8];
+              tile.partsCount = data[position + 9];
 
-            // moving to the end of the data
-            length = tile.dataEnd - position;
+              context.mainHeader = false;
+              if (tile.partIndex == 0) {
+                // reset component specific settings
+                tile.COD = context.COD;
+                tile.COC = context.COC.slice(0); // clone of the global COC
+                tile.QCD = context.QCD;
+                tile.QCC = context.QCC.slice(0); // clone of the global COC
+              }
+              context.currentTile = tile;
+              break;
+            case 0xFF93: // Start of data (SOD)
+              var tile = context.currentTile;
+              if (tile.partIndex == 0) {
+                initializeTile(context, tile.index);
+                buildPackets(context);
+              }
 
-            parseTilePackets(context, data, position, length);
-            break;
-          case 0xFF64: // Comment (COM)
-            length = readUint16(data, position);
-            // skipping content
-            break;
-          default:
-            throw 'Unknown codestream code: ' + code.toString(16);
+              // moving to the end of the data
+              length = tile.dataEnd - position;
+
+              parseTilePackets(context, data, position, length);
+              break;
+            case 0xFF64: // Comment (COM)
+              length = readUint16(data, position);
+              // skipping content
+              break;
+            default:
+              throw 'Unknown codestream code: ' + code.toString(16);
+          }
+          position += length;
         }
-        position += length;
+      } catch (e) {
+        if (this.failOnCorruptedImage)
+          error('JPX error: ' + e);
+        else
+          warn('JPX error: ' + e + '. Trying to recover');
       }
       this.tiles = transformComponents(context);
       this.width = context.SIZ.Xsiz - context.SIZ.XOsiz;
@@ -30603,6 +31131,439 @@ var JpxImage = (function JpxImageClosure() {
     }
   };
   return JpxImage;
+})();
+/* -*- Mode: Java; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+/* vim: set shiftwidth=2 tabstop=2 autoindent cindent expandtab: */
+
+'use strict';
+
+var bidi = PDFJS.bidi = (function bidiClosure() {
+  // Character types for symbols from 0000 to 00FF.
+  var baseTypes = [
+    'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'S', 'B', 'S', 'WS',
+    'B', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN',
+    'BN', 'BN', 'B', 'B', 'B', 'S', 'WS', 'ON', 'ON', 'ET', 'ET', 'ET', 'ON',
+    'ON', 'ON', 'ON', 'ON', 'ON', 'CS', 'ON', 'CS', 'ON', 'EN', 'EN', 'EN',
+    'EN', 'EN', 'EN', 'EN', 'EN', 'EN', 'EN', 'ON', 'ON', 'ON', 'ON', 'ON',
+    'ON', 'ON', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L',
+    'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'ON', 'ON',
+    'ON', 'ON', 'ON', 'ON', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L',
+    'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L',
+    'L', 'ON', 'ON', 'ON', 'ON', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'B', 'BN',
+    'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN',
+    'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN', 'BN',
+    'BN', 'CS', 'ON', 'ET', 'ET', 'ET', 'ET', 'ON', 'ON', 'ON', 'ON', 'L', 'ON',
+    'ON', 'ON', 'ON', 'ON', 'ET', 'ET', 'EN', 'EN', 'ON', 'L', 'ON', 'ON', 'ON',
+    'EN', 'L', 'ON', 'ON', 'ON', 'ON', 'ON', 'L', 'L', 'L', 'L', 'L', 'L', 'L',
+    'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L',
+    'L', 'ON', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L',
+    'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L',
+    'L', 'L', 'L', 'ON', 'L', 'L', 'L', 'L', 'L', 'L', 'L', 'L'
+  ];
+
+  // Character types for symbols from 0600 to 06FF
+  var arabicTypes = [
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'CS', 'AL', 'ON', 'ON', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM',
+    'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AN', 'AN', 'AN', 'AN', 'AN', 'AN', 'AN', 'AN', 'AN',
+    'AN', 'ET', 'AN', 'AN', 'AL', 'AL', 'AL', 'NSM', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM',
+    'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'NSM', 'ON', 'NSM',
+    'NSM', 'NSM', 'NSM', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL',
+    'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL', 'AL'
+  ];
+
+  function isOdd(i) {
+    return (i & 1) != 0;
+  }
+
+  function isEven(i) {
+    return (i & 1) == 0;
+  }
+
+  function findUnequal(arr, start, value) {
+    var j;
+    for (var j = start, jj = arr.length; j < jj; ++j) {
+      if (arr[j] != value)
+        return j;
+    }
+    return j;
+  }
+
+  function setValues(arr, start, end, value) {
+    for (var j = start; j < end; ++j) {
+      arr[j] = value;
+    }
+  }
+
+  function reverseValues(arr, start, end) {
+    for (var i = start, j = end - 1; i < j; ++i, --j) {
+      var temp = arr[i];
+      arr[i] = arr[j];
+      arr[j] = temp;
+    }
+  }
+
+  function mirrorGlyphs(c) {
+    /*
+     # BidiMirroring-1.txt
+     0028; 0029 # LEFT PARENTHESIS
+     0029; 0028 # RIGHT PARENTHESIS
+     003C; 003E # LESS-THAN SIGN
+     003E; 003C # GREATER-THAN SIGN
+     005B; 005D # LEFT SQUARE BRACKET
+     005D; 005B # RIGHT SQUARE BRACKET
+     007B; 007D # LEFT CURLY BRACKET
+     007D; 007B # RIGHT CURLY BRACKET
+     00AB; 00BB # LEFT-POINTING DOUBLE ANGLE QUOTATION MARK
+     00BB; 00AB # RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK
+     */
+    switch (c) {
+      case '(':
+        return ')';
+      case ')':
+        return '(';
+      case '<':
+        return '>';
+      case '>':
+        return '<';
+      case ']':
+        return '[';
+      case '[':
+        return ']';
+      case '}':
+        return '{';
+      case '{':
+        return '}';
+      case '\u00AB':
+        return '\u00BB';
+      case '\u00BB':
+        return '\u00AB';
+      default:
+        return c;
+    }
+  }
+
+  return (function bidi(text, startLevel) {
+    var str = text.str;
+    var strLength = str.length;
+    if (strLength == 0)
+      return str;
+
+    // get types, fill arrays
+
+    var chars = new Array(strLength);
+    var types = new Array(strLength);
+    var oldtypes = new Array(strLength);
+    var numBidi = 0;
+
+    for (var i = 0; i < strLength; ++i) {
+      chars[i] = str.charAt(i);
+
+      var charCode = str.charCodeAt(i);
+      var charType = 'L';
+      if (charCode <= 0x00ff)
+        charType = baseTypes[charCode];
+      else if (0x0590 <= charCode && charCode <= 0x05f4)
+        charType = 'R';
+      else if (0x0600 <= charCode && charCode <= 0x06ff)
+        charType = arabicTypes[charCode & 0xff];
+      else if (0x0700 <= charCode && charCode <= 0x08AC)
+        charType = 'AL';
+
+      if (charType == 'R' || charType == 'AL' || charType == 'AN')
+        numBidi++;
+
+      oldtypes[i] = types[i] = charType;
+    }
+
+    // detect the bidi method
+    //  if there are no rtl characters then no bidi needed
+    //  if less than 30% chars are rtl then string is primarily ltr
+    //  if more than 30% chars are rtl then string is primarily rtl
+    if (numBidi == 0) {
+      text.direction = 'ltr';
+      return str;
+    }
+
+    if (startLevel == -1) {
+      if ((strLength / numBidi) < 0.3) {
+        text.direction = 'ltr';
+        startLevel = 0;
+      } else {
+        text.direction = 'rtl';
+        startLevel = 1;
+      }
+    }
+
+    var levels = new Array(strLength);
+
+    for (var i = 0; i < strLength; ++i) {
+      levels[i] = startLevel;
+    }
+
+    var diffChars = new Array(strLength);
+    var diffLevels = new Array(strLength);
+    var diffTypes = new Array(strLength);
+
+    /*
+     X1-X10: skip most of this, since we are NOT doing the embeddings.
+     */
+
+    var e = isOdd(startLevel) ? 'R' : 'L';
+    var sor = e;
+    var eor = sor;
+
+    /*
+     W1. Examine each non-spacing mark (NSM) in the level run, and change the
+     type of the NSM to the type of the previous character. If the NSM is at the
+     start of the level run, it will get the type of sor.
+     */
+
+    var lastType = sor;
+    for (var i = 0; i < strLength; ++i) {
+      if (types[i] == 'NSM')
+        types[i] = lastType;
+      else
+        lastType = types[i];
+    }
+
+    /*
+     W2. Search backwards from each instance of a European number until the
+     first strong type (R, L, AL, or sor) is found.  If an AL is found, change
+     the type of the European number to Arabic number.
+     */
+
+    var lastType = sor;
+    for (var i = 0; i < strLength; ++i) {
+      var t = types[i];
+      if (t == 'EN')
+        types[i] = (lastType == 'AL') ? 'AN' : 'EN';
+      else if (t == 'R' || t == 'L' || t == 'AL')
+        lastType = t;
+    }
+
+    /*
+     W3. Change all ALs to R.
+     */
+
+    for (var i = 0; i < strLength; ++i) {
+      var t = types[i];
+      if (t == 'AL')
+        types[i] = 'R';
+    }
+
+    /*
+     W4. A single European separator between two European numbers changes to a
+     European number. A single common separator between two numbers of the same
+     type changes to that type:
+     */
+
+    for (var i = 1; i < strLength - 1; ++i) {
+      if (types[i] == 'ES' && types[i - 1] == 'EN' && types[i + 1] == 'EN')
+        types[i] = 'EN';
+      if (types[i] == 'CS' && (types[i - 1] == 'EN' || types[i - 1] == 'AN') &&
+          types[i + 1] == types[i - 1])
+        types[i] = types[i - 1];
+    }
+
+    /*
+     W5. A sequence of European terminators adjacent to European numbers changes
+     to all European numbers:
+     */
+
+    for (var i = 0; i < strLength; ++i) {
+      if (types[i] == 'EN') {
+        // do before
+        for (var j = i - 1; j >= 0; --j) {
+          if (types[j] != 'ET')
+            break;
+          types[j] = 'EN';
+        }
+        // do after
+        for (var j = i + 1; j < strLength; --j) {
+          if (types[j] != 'ET')
+            break;
+          types[j] = 'EN';
+        }
+      }
+    }
+
+    /*
+     W6. Otherwise, separators and terminators change to Other Neutral:
+     */
+
+    for (var i = 0; i < strLength; ++i) {
+      var t = types[i];
+      if (t == 'WS' || t == 'ES' || t == 'ET' || t == 'CS')
+        types[i] = 'ON';
+    }
+
+    /*
+     W7. Search backwards from each instance of a European number until the
+     first strong type (R, L, or sor) is found. If an L is found,  then change
+     the type of the European number to L.
+     */
+
+    var lastType = sor;
+    for (var i = 0; i < strLength; ++i) {
+      var t = types[i];
+      if (t == 'EN')
+        types[i] = (lastType == 'L') ? 'L' : 'EN';
+      else if (t == 'R' || t == 'L')
+        lastType = t;
+    }
+
+    /*
+     N1. A sequence of neutrals takes the direction of the surrounding strong
+     text if the text on both sides has the same direction. European and Arabic
+     numbers are treated as though they were R. Start-of-level-run (sor) and
+     end-of-level-run (eor) are used at level run boundaries.
+     */
+
+    for (var i = 0; i < strLength; ++i) {
+      if (types[i] == 'ON') {
+        var end = findUnequal(types, i + 1, 'ON');
+        var before = sor;
+        if (i > 0)
+          before = types[i - 1];
+        var after = eor;
+        if (end + 1 < strLength)
+          after = types[end + 1];
+        if (before != 'L')
+          before = 'R';
+        if (after != 'L')
+          after = 'R';
+        if (before == after)
+          setValues(types, i, end, before);
+        i = end - 1; // reset to end (-1 so next iteration is ok)
+      }
+    }
+
+    /*
+     N2. Any remaining neutrals take the embedding direction.
+     */
+
+    for (var i = 0; i < strLength; ++i) {
+      if (types[i] == 'ON')
+        types[i] = e;
+    }
+
+    /*
+     I1. For all characters with an even (left-to-right) embedding direction,
+     those of type R go up one level and those of type AN or EN go up two
+     levels.
+     I2. For all characters with an odd (right-to-left) embedding direction,
+     those of type L, EN or AN go up one level.
+     */
+
+    for (var i = 0; i < strLength; ++i) {
+      var t = types[i];
+      if (isEven(levels[i])) {
+        if (t == 'R') {
+          levels[i] += 1;
+        } else if (t == 'AN' || t == 'EN') {
+          levels[i] += 2;
+        }
+      } else { // isOdd, so
+        if (t == 'L' || t == 'AN' || t == 'EN') {
+          levels[i] += 1;
+        }
+      }
+    }
+
+    /*
+     L1. On each line, reset the embedding level of the following characters to
+     the paragraph embedding level:
+
+     segment separators,
+     paragraph separators,
+     any sequence of whitespace characters preceding a segment separator or
+     paragraph separator, and any sequence of white space characters at the end
+     of the line.
+     */
+
+    // don't bother as text is only single line
+
+    /*
+     L2. From the highest level found in the text to the lowest odd level on
+     each line, reverse any contiguous sequence of characters that are at that
+     level or higher.
+     */
+
+    // find highest level & lowest odd level
+
+    var highestLevel = -1;
+    var lowestOddLevel = 99;
+    for (var i = 0, ii = levels.length; i < ii; ++i) {
+      var level = levels[i];
+      if (highestLevel < level)
+        highestLevel = level;
+      if (lowestOddLevel > level && isOdd(level))
+        lowestOddLevel = level;
+    }
+
+    // now reverse between those limits
+
+    for (var level = highestLevel; level >= lowestOddLevel; --level) {
+      // find segments to reverse
+      var start = -1;
+      for (var i = 0, ii = levels.length; i < ii; ++i) {
+        if (levels[i] < level) {
+          if (start >= 0) {
+            reverseValues(chars, start, i);
+            start = -1;
+          }
+        } else if (start < 0) {
+          start = i;
+        }
+      }
+      if (start >= 0) {
+        reverseValues(chars, start, levels.length);
+      }
+    }
+
+    /*
+     L3. Combining marks applied to a right-to-left base character will at this
+     point precede their base character. If the rendering engine expects them to
+     follow the base characters in the final display process, then the ordering
+     of the marks and the base character must be reversed.
+     */
+
+    // don't bother for now
+
+    /*
+     L4. A character that possesses the mirrored property as specified by
+     Section 4.7, Mirrored, must be depicted by a mirrored glyph if the resolved
+     directionality of that character is R.
+     */
+
+    // don't mirror as characters are already mirrored in the pdf
+
+    // Finally, return string
+
+    var result = '';
+    for (var i = 0, ii = chars.length; i < ii; ++i) {
+      var ch = chars[i];
+      if (ch != '<' && ch != '>')
+        result += ch;
+    }
+    return result;
+  });
 })();
 
 }).call((typeof window === 'undefined') ? this : window);
